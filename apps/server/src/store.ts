@@ -14,6 +14,13 @@ const tokenSchema = z.object({ kind: z.enum(['access', 'refresh']), deviceId: z.
 const savedDeviceSchema = z.object({ descriptor: accountDeviceDescriptorSchema, revoked: z.boolean(), lastSeenAt: z.number() })
 const stateSchema = z.object({ version: z.literal(1), account: z.string(), salt: z.string(), verifier: z.string(), devices: z.record(z.string(), savedDeviceSchema), tokens: z.record(z.string(), tokenSchema) })
 type SavedDevice = z.infer<typeof savedDeviceSchema>
+/**
+ * A stored device plus the account it belongs to. This Server is single-account,
+ * so `accountId` is the store's own account; it exists so the Gateway can refuse
+ * a cross-account link the moment this Server grows a second account, and so the
+ * check is already in place (and already tested) before that change lands.
+ */
+export type AuthenticatedDevice = SavedDevice & { accountId: string }
 
 /** Single-process store. Only token digests and public identities reach disk. */
 export class Store {
@@ -42,6 +49,23 @@ export class Store {
     return d
   }
   list(): SavedDevice[] { return Object.values(this.state.devices).filter(d => !d.revoked) }
+  /**
+   * Devices the given account is allowed to see. This Server is single-account,
+   * so every stored device belongs to `this.account` and any other id sees none.
+   * Reading through here keeps every call site already account-scoped for the
+   * day a second account exists.
+   */
+  listFor(accountId: string): SavedDevice[] { return accountId === this.account ? this.list() : [] }
+  /**
+   * Read a device the given account is allowed to see. A device owned by another
+   * account must look exactly like a missing one: reporting 403 instead would
+   * turn callers into existence probes for foreign deviceIds.
+   */
+  getOwned(id: string, accountId: string): SavedDevice {
+    const d = this.get(id)
+    if (accountId !== this.account) throw new ApiError('DEVICE_NOT_FOUND', 404)
+    return d
+  }
   register(descriptor: AccountDeviceDescriptor): ReturnType<Store['issue']> {
     const old = this.state.devices[descriptor.deviceId]
     if (old?.revoked) throw new ApiError('DEVICE_REVOKED', 403)
@@ -61,11 +85,11 @@ export class Store {
     this.save()
     return { accessToken, refreshToken, accessTokenExpiresAt, refreshTokenExpiresAt }
   }
-  authenticate(token: string): SavedDevice {
+  authenticate(token: string): AuthenticatedDevice {
     const record = this.state.tokens[hash(token)]
     if (!record || record.kind !== 'access') throw new ApiError('AUTH_INVALID', 401)
     if (record.expires <= Date.now()) throw new ApiError('TOKEN_EXPIRED', 401)
-    return this.get(record.deviceId)
+    return { ...this.get(record.deviceId), accountId: this.account }
   }
   refresh(deviceId: string, token: string) {
     this.get(deviceId)

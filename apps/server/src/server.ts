@@ -277,22 +277,24 @@ export function createRemoteServer(config: Config) {
     if (method === 'GET' && path === '/api/v1/devices') {
       const source = deviceAuth(req)
       if (source.descriptor.role !== 'client') throw new ApiError('MEMBERSHIP_REQUIRED', 403)
-      const items = store.list().filter(d => d.descriptor.role === 'host').map(d => {
-        const { identityKey: _key, ...item } = descriptor(d)
-        return item
-      })
+      const items = store.listFor(source.accountId)
+        .filter(d => d.descriptor.role === 'host')
+        .map(d => {
+          const { identityKey: _key, ...item } = descriptor(d)
+          return item
+        })
       json(res, 200, { items, nextCursor: null }); return
     }
     const renameMatch = /^\/api\/v1\/devices\/([^/]+)\/name$/.exec(path)
     if (method === 'POST' && renameMatch) {
       accountAuth(req)
       const { name } = z.object({ name: z.string().trim().min(1).max(80) }).parse(await body(req))
-      store.rename(renameMatch[1]!, name)
+      store.rename(store.getOwned(renameMatch[1]!, store.account).descriptor.deviceId, name)
       json(res, 200, descriptor(store.get(renameMatch[1]!))); return
     }
     const match = /^\/api\/v1\/devices\/([^/]+)(\/presence)?$/.exec(path)
     if (method === 'GET' && match) {
-      const source = deviceAuth(req), target = store.get(match[1]!)
+      const source = deviceAuth(req), target = store.getOwned(match[1]!, source.accountId)
       if (source.descriptor.role === target.descriptor.role) throw new ApiError('MEMBERSHIP_REQUIRED', 403)
       const d = descriptor(target)
       json(res, 200, match[2] ? { deviceId: d.deviceId, online: d.online, lastSeenAt: d.lastSeenAt } : d); return

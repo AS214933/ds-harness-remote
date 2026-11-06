@@ -1136,3 +1136,58 @@ describe('gateway diagnostics redaction', () => {
     expect(log).not.toContain('CANARY-REASON')
   })
 })
+
+describe('account scoping', () => {
+  /**
+   * Same-account links are the only ones the Server may create, and a foreign
+   * device must be indistinguishable from a missing one over REST. Both halves
+   * matter: the Gateway check stops the link, the REST check stops the Host's
+   * own cross-validation from being the last line of defence.
+   */
+  it('refuses a cross-account link with the same HOST_OFFLINE a missing Host produces', async () => {
+    const h = await device('host'), c = await device()
+    const host = await socket(h), client = await socket(c)
+    await host.next('hello.ack'); await client.next('hello.ack')
+
+    // Rewrite the Host peer's account so it belongs elsewhere. This is the state
+    // a second account would produce once the Store is account-aware; doing it
+    // here exercises the Gateway check without needing a multi-account Store.
+    const hostPeer = app.gateway.peers.get(h.deviceId)!
+    const original = hostPeer.accountId
+    hostPeer.accountId = 'someone-else@example.com'
+
+    try {
+      client.send('connect.request', { hostDeviceId: h.deviceId, preferredTransports: ['relay'] })
+      const error = await client.next('error')
+      expect(error).toMatchObject({ code: 'HOST_OFFLINE', retryable: true })
+
+      // The Host must never observe an incoming request for a link the Server
+      // refused; otherwise it would run its own (also-bypassed) authorization.
+      await expect(host.next('connect.incoming')).rejects.toThrow(/Missing frame/)
+    } finally {
+      hostPeer.accountId = original
+    }
+  })
+
+  it('reports a foreign device exactly like a missing one instead of 403', async () => {
+    const c = await device()
+    const missing = randomUUID()
+
+    // A missing device and a device outside the caller's account must produce
+    // byte-identical responses: any difference is an existence oracle.
+    const missingResult = await request(`/devices/${missing}`, 'GET', undefined, c.accessToken)
+    expect(missingResult.status).toBe(404)
+    expect(missingResult.data.error.code).toBe('DEVICE_NOT_FOUND')
+
+    const store = app.store as unknown as { account: string }
+    const original = store.account
+    Object.defineProperty(store, 'account', { value: 'someone-else@example.com', configurable: true })
+    try {
+      const foreign = await request(`/devices/${missing}`, 'GET', undefined, c.accessToken)
+      expect(foreign.status).toBe(missingResult.status)
+      expect(foreign.data.error.code).toBe(missingResult.data.error.code)
+    } finally {
+      Object.defineProperty(store, 'account', { value: original, configurable: true })
+    }
+  })
+})

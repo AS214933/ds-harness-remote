@@ -34,7 +34,7 @@ export interface GatewayOptions extends GatewayTimingOptions {
  */
 type ConnectionState = 'awaiting_hello' | 'authenticated' | 'closing' | 'closed'
 
-type Peer = { ws: WebSocket; id: string; role: 'host' | 'client'; capabilities: string[]; version: string; lastPong: number; nonce?: string }
+type Peer = { ws: WebSocket; id: string; role: 'host' | 'client'; accountId: string; capabilities: string[]; version: string; lastPong: number; nonce?: string }
 type Link = { id: string; host: string; client: string; stage: 'pending' | 'accepted' | 'handshake' | 'ready'; created: number; counters: Map<string, number>; preferredTransports: TransportName[]; iceCandidates: number }
 
 /** Protocol v1 default: at most 256 ICE candidates per logical connection. */
@@ -315,7 +315,10 @@ export class Gateway {
         if (state === 'awaiting_hello') {
           if (frame.type !== 'hello') throw new ApiError('AUTH_REQUIRED')
           const p = frame.payload as HelloPayload
-          const device = this.store.authenticate(p.accessToken).descriptor
+          // Authenticate once and keep the whole record: accountId is needed so
+          // connect.request can refuse a cross-account link (see handle()).
+          const saved = this.store.authenticate(p.accessToken)
+          const device = saved.descriptor
           if (device.deviceId !== p.deviceId || device.role !== p.role) throw new ApiError('AUTH_INVALID')
           if (!p.protocols.includes(1)) throw new ApiError('UNSUPPORTED_VERSION')
           // Re-assert the state: if the deadline fired while credentials were
@@ -327,7 +330,7 @@ export class Gateway {
           // Keep the negotiated set (what hello.ack advertises), so a link can
           // never coordinate a transport this Server did not offer — e.g. TURN
           // while no TURN deployment is configured.
-          peer = { ws, id: device.deviceId, role: device.role, capabilities: this.negotiatedCapabilities(p.capabilities), version: p.clientVersion ?? device.clientVersion, lastPong: Date.now() }
+          peer = { ws, id: device.deviceId, role: device.role, accountId: saved.accountId, capabilities: this.negotiatedCapabilities(p.capabilities), version: p.clientVersion ?? device.clientVersion, lastPong: Date.now() }
           this.peers.set(peer.id, peer)
           this.store.touch(peer.id, p.clientVersion, p.harnessVersion)
           this.logger.info('ws_hello_authenticated', {
@@ -395,6 +398,10 @@ export class Gateway {
       const host = this.peers.get(request.hostDeviceId)
       if (!host || host.role !== 'host') { this.send(peer, createControlFrame('error', { code: 'HOST_OFFLINE', message: 'Host is offline.', retryable: true })); return }
       this.store.get(host.id)
+      // Only a Host in the same account may be linked. Report the same
+      // HOST_OFFLINE a genuinely offline Host produces: a distinct code here
+      // would let a Client probe which deviceIds exist under other accounts.
+      if (host.accountId !== peer.accountId) { this.send(peer, createControlFrame('error', { code: 'HOST_OFFLINE', message: 'Host is offline.', retryable: true })); return }
       if (!request.preferredTransports.includes('relay') || !peer.capabilities.includes('transport.relay') || !host.capabilities.includes('transport.relay')) throw new ApiError('CAPABILITY_NOT_SUPPORTED')
       // The link coordinates only transports both peers actually advertised;
       // the Host receives the same intersection so it never sees a transport
