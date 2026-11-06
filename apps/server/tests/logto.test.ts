@@ -407,3 +407,48 @@ describe('login rate limiting', () => {
     } finally { await app.close() }
   }, 20_000)
 })
+
+describe('credential hygiene', () => {
+  it('never surfaces the M2M secret or the token in an error', async () => {
+    // The secret grants full tenant control (see docs/DEPLOYMENT.md §0), so any
+    // path that echoes it into a response or a log is a privilege leak.
+    const fetchStub = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.endsWith('/oidc/token')) {
+        return new Response(JSON.stringify({ access_token: 'super-secret-token', expires_in: 3600 }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      // Every downstream call fails in a way that could tempt an implementation
+      // to include the response body in the error.
+      return new Response(JSON.stringify({ error: 'boom', token: 'super-secret-token' }), { status: 500 })
+    })
+    vi.stubGlobal('fetch', fetchStub)
+    const provider = new LogtoAuthProvider(config)
+    const result = await provider.authenticate('a@b.com', 'pw')
+    expect(result).toEqual({ ok: false, reason: 'unavailable' })
+    const serialised = JSON.stringify(result)
+    expect(serialised).not.toContain('super-secret-token')
+    expect(serialised).not.toContain('client-secret')
+  })
+
+  it('does not leak whether a failure was the token or the lookup', async () => {
+    // Both collapse to `unavailable`; distinguishing them would tell an attacker
+    // which half of the configuration is wrong.
+    const failUsers = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.endsWith('/oidc/token')) {
+        return new Response(JSON.stringify({ access_token: 't', expires_in: 3600 }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('{}', { status: 500 })
+    })
+    vi.stubGlobal('fetch', failUsers)
+    const lookupFailure = await new LogtoAuthProvider(config).authenticate('a@b.com', 'pw')
+
+    stub({ tokenStatus: 500 })
+    const tokenFailure = await new LogtoAuthProvider(config).authenticate('a@b.com', 'pw')
+
+    expect(tokenFailure).toEqual(lookupFailure)
+    expect(tokenFailure).toEqual({ ok: false, reason: 'unavailable' })
+  })
+})
