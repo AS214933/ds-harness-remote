@@ -27,6 +27,7 @@ const accountSchema = z.object({
   status: z.enum(['active', 'suspended']),
 })
 type Account = z.infer<typeof accountSchema>
+export type { Account }
 /**
  * version 2 introduced `accounts` and moved device indices under it. version 1
  * (a single `account` string plus a password verifier) still parses so an
@@ -102,6 +103,49 @@ export class Store {
   private accountIdFor(account: string): string { return `account:${hash(account).slice(0, 16)}` }
   /** The account a request belongs to while the Server is single-account. */
   get accountId(): string { return this.accountIdFor(this.account) }
+
+  /**
+   * Find or create the account for an identity-provider subject.
+   *
+   * Keyed by `externalId` rather than email: the address is mutable and, after a
+   * user is deleted, re-registerable by someone else. Reusing it as a key would
+   * hand the new person the previous owner's devices.
+   *
+   * A first login adopts the environment account instead of creating a second
+   * one, so an operator switching on Logto keeps their paired devices. That
+   * adoption is only safe for the very first subject and while the environment
+   * account is the current owner; afterwards new subjects get their own account.
+   */
+  upsertAccount(identity: { externalId: string; email: string; isAdmin: boolean }): Account {
+    const byExternal = Object.values(this.state.accounts).find(a => a.externalId === identity.externalId)
+    if (byExternal) {
+      byExternal.email = identity.email
+      byExternal.isAdmin = identity.isAdmin
+      this.save()
+      return byExternal
+    }
+
+    // Adopt the environment account on first Logto login: it has no externalId
+    // yet and still owns the devices registered before Logto was configured.
+    const legacyId = this.accountId
+    const legacy = this.state.accounts[legacyId]
+    const adopt = legacy !== undefined && legacy.externalId === undefined && Object.keys(this.state.accounts).length === 1
+    const id = adopt ? legacyId : `account:${hash(identity.externalId).slice(0, 16)}`
+    const existing = this.state.accounts[id]
+    const account: Account = {
+      id,
+      externalId: identity.externalId,
+      email: identity.email,
+      isAdmin: identity.isAdmin,
+      status: existing?.status ?? 'active',
+    }
+    this.state.accounts[id] = account
+    // Keep `account` pointing at the adopted owner so device registration and the
+    // password fallback keep working.
+    if (adopt) this.state.account = identity.email
+    this.save()
+    return account
+  }
   private save(): void {
     mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 })
     const tmp = `${this.file}.tmp`

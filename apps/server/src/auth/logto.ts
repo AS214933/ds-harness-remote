@@ -53,12 +53,27 @@ interface LogtoUser {
 class LogtoUnavailable extends Error {}
 
 /**
- * Spend a comparable amount of time on the "no such user" path so that a
- * missing account and a wrong password cost the same. Without this the faster
- * 404 lookup makes email enumeration trivial.
+ * Equalise the cost of every failure path.
+ *
+ * Measured against Logto 1.46 the three paths differ a lot: an unknown address
+ * answers in ~70ms because it skips password hashing, a wrong password costs the
+ * argon2 verify, and a correct password costs verify plus the admin-role lookup.
+ * Any of those differences is an oracle for "does this address exist".
+ *
+ * Rather than guess a per-path delay, every failure is padded at a single exit
+ * point up to a fixed budget. Successful logins are left alone: they are the
+ * only path a legitimate user takes, and their cost does not reveal anything an
+ * attacker does not already know (they had the password).
  */
-async function burnTime(): Promise<void> {
-  await new Promise(resolve => setTimeout(resolve, 25 + Math.floor(Math.random() * 15)))
+const FAILURE_BUDGET_MS = 700
+
+/** Pad a failure so its total wall time matches the budget. Never sleeps less than jitter. */
+async function padFailure(startedAt: number): Promise<void> {
+  const elapsed = Date.now() - startedAt
+  // Spread the remainder so the padding itself does not look like a fixed step.
+  const jitter = Math.floor(Math.random() * 60)
+  const wait = Math.max(0, FAILURE_BUDGET_MS - elapsed) + jitter
+  await new Promise(resolve => setTimeout(resolve, wait))
 }
 
 /** Constant-time string compare that does not leak length through early exit. */
@@ -161,13 +176,16 @@ export class LogtoAuthProvider implements AuthProvider {
   }
 
   async authenticate(email: string, password: string): Promise<AuthOutcome> {
+    const startedAt = Date.now()
     const normalized = email.trim().toLowerCase()
+    // Empty input costs nothing to produce and runs before any I/O, so it cannot
+    // be distinguished from a rejected login by timing anyway.
     if (!normalized || !password) return { ok: false, reason: 'invalid' }
 
     let user: LogtoUser | 'none' | 'ambiguous'
     try { user = await this.findByEmail(normalized) } catch { return { ok: false, reason: 'unavailable' } }
-    if (user === 'none') { await burnTime(); return { ok: false, reason: 'invalid' } }
-    if (user === 'ambiguous') { await burnTime(); return { ok: false, reason: 'ambiguous' } }
+    if (user === 'none') { await padFailure(startedAt); return { ok: false, reason: 'invalid' } }
+    if (user === 'ambiguous') { await padFailure(startedAt); return { ok: false, reason: 'ambiguous' } }
 
     let verified: Response
     try {
@@ -180,13 +198,14 @@ export class LogtoAuthProvider implements AuthProvider {
 
     // 422 = wrong password (also returned for a user with no password set),
     // 404 = the user was deleted between the lookup and this call.
-    if (verified.status === 422 || verified.status === 404) { await burnTime(); return { ok: false, reason: 'invalid' } }
+    if (verified.status === 422 || verified.status === 404) { await padFailure(startedAt); return { ok: false, reason: 'invalid' } }
     if (verified.status !== 204) return { ok: false, reason: 'unavailable' }
 
     // Only after the password is known good do we reveal that the account is
     // suspended. Checking first would let an attacker distinguish "no such
-    // account" from "exists but suspended" by the status code alone.
-    if (user.isSuspended === true) return { ok: false, reason: 'suspended' }
+    // account" from "exists but suspended" by the status code alone. Suspension
+    // is padded too: it is a failure an attacker can observe.
+    if (user.isSuspended === true) { await padFailure(startedAt); return { ok: false, reason: 'suspended' } }
 
     const isAdmin = await this.isAdmin(user.id)
     return { ok: true, externalId: user.id, email: normalized, isAdmin }

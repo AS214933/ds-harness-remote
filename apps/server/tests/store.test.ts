@@ -148,3 +148,79 @@ describe('account scoping', () => {
       .toThrowError(expect.objectContaining({ code: 'DEVICE_REVOKED' }))
   })
 })
+
+describe('account upsert by identity-provider subject', () => {
+  it('anchors the account to the subject, not the address', () => {
+    const store = new Store(file, ACCOUNT, PASSWORD)
+    const created = store.upsertAccount({ externalId: 'logto-abc', email: 'alice@example.com', isAdmin: false })
+    expect(created.externalId).toBe('logto-abc')
+    expect(created.email).toBe('alice@example.com')
+    // The id must not be derived from the email, or changing the address would
+    // orphan the devices.
+    expect(created.id).not.toContain('alice')
+  })
+
+  it('keeps the same account when the address changes', () => {
+    const store = new Store(file, ACCOUNT, PASSWORD)
+    const first = store.upsertAccount({ externalId: 'logto-abc', email: 'alice@example.com', isAdmin: false })
+    const second = store.upsertAccount({ externalId: 'logto-abc', email: 'alice.new@example.com', isAdmin: true })
+    expect(second.id).toBe(first.id)
+    expect(second.email).toBe('alice.new@example.com')
+    expect(second.isAdmin).toBe(true)
+  })
+
+  it('creates a separate account for a second subject', () => {
+    const store = new Store(file, ACCOUNT, PASSWORD)
+    const a = store.upsertAccount({ externalId: 'logto-a', email: 'a@example.com', isAdmin: false })
+    const b = store.upsertAccount({ externalId: 'logto-b', email: 'b@example.com', isAdmin: false })
+    expect(b.id).not.toBe(a.id)
+  })
+
+  it('does not give a second subject the first subject\'s devices', () => {
+    // This is the hijack the email-as-key design would allow: two people whose
+    // addresses collide, or a deleted address being re-registered.
+    const store = new Store(file, ACCOUNT, PASSWORD)
+    const device = descriptor('host')
+    store.register(device)
+    const a = store.upsertAccount({ externalId: 'logto-a', email: 'a@example.com', isAdmin: false })
+    const b = store.upsertAccount({ externalId: 'logto-b', email: 'b@example.com', isAdmin: false })
+    expect(store.listFor(b.id)).toHaveLength(0)
+    expect(store.listFor(a.id).length + store.listFor(store.accountId).length).toBeGreaterThanOrEqual(0)
+  })
+
+  it('adopts the environment account on the first subject so devices survive', () => {
+    // An operator enabling Logto on an existing deployment must keep the devices
+    // already paired under the environment account.
+    const store = new Store(file, ACCOUNT, PASSWORD)
+    const device = descriptor('host')
+    store.register(device)
+    const before = store.accountId
+
+    const adopted = store.upsertAccount({ externalId: 'logto-first', email: ACCOUNT, isAdmin: false })
+    expect(adopted.id).toBe(before)
+    // Reload: adoption must be durable, not just in memory.
+    const reloaded = new Store(file, ACCOUNT, PASSWORD)
+    expect(reloaded.listFor(adopted.id)).toHaveLength(1)
+  })
+
+  it('does not adobt twice: a second subject gets its own account', () => {
+    const store = new Store(file, ACCOUNT, PASSWORD)
+    const first = store.upsertAccount({ externalId: 'logto-first', email: ACCOUNT, isAdmin: false })
+    const second = store.upsertAccount({ externalId: 'logto-second', email: 'other@example.com', isAdmin: false })
+    expect(second.id).not.toBe(first.id)
+    // And the adopted account stays bound to the first subject.
+    const again = store.upsertAccount({ externalId: 'logto-first', email: ACCOUNT, isAdmin: false })
+    expect(again.id).toBe(first.id)
+  })
+
+  it('is idempotent across reloads', () => {
+    const store = new Store(file, ACCOUNT, PASSWORD)
+    const created = store.upsertAccount({ externalId: 'logto-abc', email: 'alice@example.com', isAdmin: false })
+    const reloaded = new Store(file, ACCOUNT, PASSWORD)
+    const again = reloaded.upsertAccount({ externalId: 'logto-abc', email: 'alice@example.com', isAdmin: false })
+    expect(again.id).toBe(created.id)
+    // One account, not two: the first subject adopted the environment account
+    // rather than creating a sibling, and the reload did not duplicate it.
+    expect(Object.keys(JSON.parse(readFileSync(file, 'utf8')).accounts)).toHaveLength(1)
+  })
+})

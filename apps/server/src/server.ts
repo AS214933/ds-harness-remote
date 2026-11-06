@@ -160,11 +160,11 @@ export function clientAddress(req: IncomingMessage, trustedProxyIps: ReadonlySet
   return forwarded
 }
 /**
- * Who the caller is, in the terms the login response needs. Deliberately does
- * not carry the provider's own identifiers so nothing downstream depends on
- * which identity provider produced this.
+ * Who the caller is, in the terms the login response needs. `externalId` is the
+ * identity-provider subject when a provider is configured, and is what ties a
+ * device to its owner; it is absent for the environment single account.
  */
-interface LoginIdentity { account: string; displayName: string; isAdmin: boolean }
+interface LoginIdentity { account: string; displayName: string; isAdmin: boolean; externalId?: string }
 
 /** Environment-variable single account: the original behaviour. */
 function verifyWithConfig(config: Config, credentials: { email: string; password: string }): LoginIdentity {
@@ -192,7 +192,7 @@ async function verifyWithProvider(
     if (outcome.reason === 'invalid' || outcome.reason === 'ambiguous') throw new ApiError('AUTH_INVALID', 401)
     throw new ApiError('AUTH_SERVICE_UNAVAILABLE', 503)
   }
-  return { account: outcome.email, displayName: outcome.email, isAdmin: outcome.isAdmin }
+  return { account: outcome.email, displayName: outcome.email, isAdmin: outcome.isAdmin, externalId: outcome.externalId }
 }
 
 export function createRemoteServer(config: Config) {
@@ -294,6 +294,13 @@ export function createRemoteServer(config: Config) {
       const identity = config.auth
         ? await verifyWithProvider(config.auth, credentials.email, credentials.password)
         : verifyWithConfig(config, credentials)
+      // Anchor the session to a durable account row. With a provider this is the
+      // Logto subject; without one it is the environment account. Devices are
+      // owned through this id, so the login and the device routes agree on who
+      // the caller is even after an address changes.
+      if (identity.externalId !== undefined) {
+        store.upsertAccount({ externalId: identity.externalId, email: identity.account, isAdmin: identity.isAdmin })
+      }
       for (const [key, expires] of sessions) if (expires <= Date.now()) sessions.delete(key)
       if (sessions.size >= 256) throw new ApiError('RATE_LIMITED', 429)
       const value = secret(), expiresAt = Date.now() + 8 * 3600_000
