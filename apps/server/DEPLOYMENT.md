@@ -28,7 +28,45 @@ select count(*) from scopes
 > Logto provides a built-in "Logto Management API" resource, it's a **readonly resource
 > with the `all` permission to access Logto Management API**
 
+**而且这不是“尚未实现”，是 Logto 主动禁止修改：**
+
+```json
+POST /api/resources/management-api/scopes
+→ 400 {"code":"resource.cannot_modify_management_api",
+       "message":"Cannot modify Logto Management API."}
+
+PATCH /api/resources/management-api
+→ 400 {"code":"resource.cannot_modify_management_api"}
+```
+
 所以 Console → Applications → 你的 M2M 应用 → Roles 里，**能选的只有“分配/不分配那个含 all 的 role”，没有更细的粒度**。
+
+### 0.1.1 ⚠️ 一个容易误判的行为
+
+**【实测】** 向 token 端点请求一个不存在的 scope，**不会报错**：
+
+| 请求的 scope | HTTP | 实际授予 |
+| --- | --- | --- |
+| `users:read` | 200 | **`None`**（空权限） |
+| `password:verify` | 200 | `None` |
+| `all` | 200 | `all` |
+| （空） | 200 | `None` |
+
+**陷阱**：传 `users:read` 会拿到一个 200 和一枚 token，看起来“细粒度授权成功了”，
+但那枚 token **什么权限都没有**。真正的全权限只有 `all` 一个来源。
+
+这也是 `auth/logto.ts` 里把 `scope` 硬编码为 `'all'` 的原因——
+不是偷懒，是不存在别的值。
+
+### 0.1.2 这是可预期的未来能力
+
+Logto 官方博客（[Exploring the Management API](https://blog.logto.io/explore-management-api)）：
+
+> It includes `all` permissions by default. **As Logto grows, we will continue to make
+> permissions more granular.**
+
+所以不要把 §0.1 当成永久约束：将来若出现细粒度 scope，
+`auth/logto.ts` 里只需改 `scope` 一个字段就能收窄。**值得在升级 Logto 时复查一次**。
 
 **这带来一个必须接受的事实：我们的 Server 只需要 3 个只读能力，却必须持有能删用户的凭据。**
 
@@ -340,10 +378,11 @@ curl -s -X POST https://remote.example.com/api/v1/auth/login \
 
 ```bash
 # 重新播种测试用户（幂等，可反复跑；探测脚本可能删过账号）
-python3 logto-lab/seed_for_ts_test.py
+cd apps/server/tools
+python3 seed_for_ts_test.py
 
-python3 docs/verify_logto.py        # 核心链路
-python3 docs/verify_mfa.py          # MFA / 停用 / 删除
+python3 ../../../docs/verify_logto.py    # 核心链路（或按你的路径调整）
+python3 ../../../docs/verify_mfa.py      # MFA / 停用 / 删除
 ```
 
 > 集成测试依赖固定的测试账号（`t_happy@example.com` 等）。
@@ -357,6 +396,29 @@ python3 docs/verify_mfa.py          # MFA / 停用 / 删除
 3. `mode.primaryEmail=exact` 仍**是**精确匹配
 
 > 它们目前是“对我们有利的未检查”。Logto 哪天收紧了，我们的方案会**静默失效**——脚本就是防线。
+
+### 7.3 升级 Logto 后额外复查：细粒度权限是否已出现
+
+```bash
+cd apps/server/tools
+python3 probe_scope_narrowing.py
+```
+
+关注第 1 节输出：如果 `management-api` 的 scope 不再是单个 `management-api-all`，
+说明 Logto 开始提供细粒度权限（§0.1.2）。**那时应该把 `auth/logto.ts` 的 `scope`
+从 `all` 收窄到只需要的那几个**，这是降低泄露影响范围最直接的一次机会。
+
+### 7.4 评估泄露影响范围
+
+```bash
+cd apps/server/tools
+python3 probe_blast_radius.py <client_id> <client_secret>
+```
+
+用一份 M2M 凭据逐项验证它实际能做什么（只读、写、持久化后门）。
+
+> ⚠️ 这个脚本**会真的删除用户**（为了验证 `DELETE` 可达）。**只对测试租户运行**，
+> 或用后重新播种测试账号（§7.2）。
 
 ---
 
