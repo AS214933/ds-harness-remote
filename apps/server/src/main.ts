@@ -8,6 +8,7 @@ import {
 } from './server.js'
 import { parseLogLevel } from './logger.js'
 import { parseIceConfig } from './ice.js'
+import { createLogtoAuth } from './auth/logto.js'
 
 const port = Number(process.env.DSH_SERVER_PORT ?? '8080')
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid DSH_SERVER_PORT.')
@@ -17,6 +18,11 @@ const heartbeatDisconnectMs = parseHeartbeatDisconnect(process.env.DSH_SERVER_HE
 const helloTimeoutMs = parseHelloTimeout(process.env.DSH_SERVER_HELLO_TIMEOUT_MS)
 const forceTerminateGraceMs = parseForceTerminateGrace(process.env.DSH_SERVER_FORCE_TERMINATE_GRACE_MS)
 const logLevel = parseLogLevel(process.env.DSH_SERVER_LOG_LEVEL)
+
+// Logto is opt-in: without LOGTO_ENDPOINT the Server keeps its original
+// environment-variable single-account check, so existing deployments are
+// unaffected by upgrading.
+const auth = process.env.LOGTO_ENDPOINT ? createLogtoAuth(process.env) : undefined
 
 const app = createRemoteServer({
   account: process.env.DSH_SERVER_ACCOUNT ?? '',
@@ -30,6 +36,7 @@ const app = createRemoteServer({
   forceTerminateGraceMs,
   logLevel,
   ice: parseIceConfig(process.env),
+  ...(auth ? { auth } : {}),
 })
 app.server.listen(port, process.env.DSH_SERVER_HOST ?? '127.0.0.1', () => console.info(`Remote Server listening on port ${port}`))
 app.server.on('error', () => { console.error('Remote Server could not listen. Check address and port.'); process.exitCode = 1; app.gateway.close() })

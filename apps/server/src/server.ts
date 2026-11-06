@@ -7,6 +7,7 @@ import { isIP } from 'node:net'
 import { z } from 'zod'
 import { deviceRegistrationRequestSchema, deviceRefreshRequestSchema } from '@dsh-remote/protocol'
 import { ApiError, Store, equal, hash, secret } from './store.js'
+import type { AuthOutcome, AuthProvider } from './auth/logto.js'
 import { Gateway } from './gateway.js'
 import { buildIceServers, parseIceConfig, type IceConfig } from './ice.js'
 import { Logger, type LogLevel } from './logger.js'
@@ -34,6 +35,13 @@ export interface Config {
   forceTerminateGraceMs?: number
   logLevel?: LogLevel
   ice?: IceConfig
+  /**
+   * When set, `POST /api/v1/auth/login` verifies credentials through this
+   * provider instead of comparing against `password`. The environment-variable
+   * single-account check stays as the fallback so a self-hosting operator who
+   * has not configured Logto keeps working unchanged.
+   */
+  auth?: AuthProvider
 }
 
 /**
@@ -151,6 +159,42 @@ export function clientAddress(req: IncomingMessage, trustedProxyIps: ReadonlySet
   if (forwarded === null) throw new ApiError('INVALID_MESSAGE')
   return forwarded
 }
+/**
+ * Who the caller is, in the terms the login response needs. Deliberately does
+ * not carry the provider's own identifiers so nothing downstream depends on
+ * which identity provider produced this.
+ */
+interface LoginIdentity { account: string; displayName: string; isAdmin: boolean }
+
+/** Environment-variable single account: the original behaviour. */
+function verifyWithConfig(config: Config, credentials: { email: string; password: string }): LoginIdentity {
+  if (!equal(credentials.email.trim(), config.account) || !equal(credentials.password, config.password)) {
+    throw new ApiError('AUTH_INVALID', 401)
+  }
+  return { account: config.account, displayName: config.account, isAdmin: false }
+}
+
+/**
+ * Provider-backed login. Logto is the only source of truth here: the provider
+ * has already applied its own suspension check, so this only translates the
+ * outcome into the wire error codes the clients already understand.
+ */
+async function verifyWithProvider(
+  auth: AuthProvider,
+  email: string,
+  password: string,
+): Promise<LoginIdentity> {
+  const outcome: AuthOutcome = await auth.authenticate(email, password)
+  if (!outcome.ok) {
+    if (outcome.reason === 'suspended') throw new ApiError('ACCOUNT_SUSPENDED', 403)
+    // 'invalid' and 'ambiguous' deliberately collapse to one response: telling a
+    // caller that an address is ambiguous would confirm it exists.
+    if (outcome.reason === 'invalid' || outcome.reason === 'ambiguous') throw new ApiError('AUTH_INVALID', 401)
+    throw new ApiError('AUTH_SERVICE_UNAVAILABLE', 503)
+  }
+  return { account: outcome.email, displayName: outcome.email, isAdmin: outcome.isAdmin }
+}
+
 export function createRemoteServer(config: Config) {
   if (!config.account.trim() || config.password.length < 12) throw new Error('DSH_SERVER_ACCOUNT and DSH_SERVER_PASSWORD (at least 12 characters) are required.')
   const url = new URL(config.publicUrl)
@@ -181,7 +225,14 @@ export function createRemoteServer(config: Config) {
     return store.authenticate(req.headers.authorization.slice(7))
   }
   function cookie(value: string, age: number): string { return `dsh_session=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${age}${url.protocol === 'https:' ? '; Secure' : ''}` }
-  const profile = () => ({ account: store.account, profile: { displayName: store.account }, isAdmin: false })
+  /**
+   * Identity per web session, so `/auth/me` reflects who actually signed in
+   * rather than echoing the environment-variable account. Keyed by the same
+   * session digest as `sessions` and evicted with it.
+   */
+  const sessionIdentities = new Map<string, LoginIdentity>()
+  const profileFor = (digest: string): LoginIdentity =>
+    sessionIdentities.get(digest) ?? { account: store.account, displayName: store.account, isAdmin: false }
   const server = createServer({ requestTimeout: 15000, headersTimeout: 10000 }, (req, res) => {
     res.setHeader('Cache-Control', 'no-store')
     res.setHeader('X-Content-Type-Options', 'nosniff')
@@ -237,17 +288,46 @@ export function createRemoteServer(config: Config) {
     if (method === 'POST' && path === '/api/v1/auth/login') {
       rate(`login:${client}`, 20)
       const credentials = loginSchema.parse(await body(req))
-      if (!equal(credentials.email.trim(), store.account) || !equal(credentials.password, config.password)) throw new ApiError('AUTH_INVALID', 401)
+      // With a provider configured, Logto decides whether the credentials are
+      // good and whether the account may sign in. Without one, fall back to the
+      // environment-variable single account so existing deployments are unchanged.
+      const identity = config.auth
+        ? await verifyWithProvider(config.auth, credentials.email, credentials.password)
+        : verifyWithConfig(config, credentials)
       for (const [key, expires] of sessions) if (expires <= Date.now()) sessions.delete(key)
       if (sessions.size >= 256) throw new ApiError('RATE_LIMITED', 429)
       const value = secret(), expiresAt = Date.now() + 8 * 3600_000
-      sessions.set(hash(value), expiresAt)
+      // Evict the identity alongside the session it belongs to.
+      for (const [key, expires] of sessions) {
+        if (expires <= Date.now()) { sessions.delete(key); sessionIdentities.delete(key) }
+      }
+      const digest = hash(value)
+      sessions.set(digest, expiresAt)
+      sessionIdentities.set(digest, identity)
       res.setHeader('Set-Cookie', cookie(value, 8 * 3600))
-      json(res, 200, { ...profile(), token: value, expiresAt }); return
+      // Response shape is unchanged from the single-account version: the shipped
+      // clients parse exactly these fields.
+      json(res, 200, {
+        account: identity.account,
+        profile: { displayName: identity.displayName },
+        isAdmin: identity.isAdmin,
+        token: value,
+        expiresAt,
+      }); return
     }
-    if (method === 'GET' && path === '/api/v1/auth/me') { accountAuth(req); json(res, 200, profile()); return }
+    if (method === 'GET' && path === '/api/v1/auth/me') {
+      accountAuth(req)
+      const identity = profileFor(hash(token(req)))
+      json(res, 200, {
+        account: identity.account,
+        profile: { displayName: identity.displayName },
+        isAdmin: identity.isAdmin,
+      }); return
+    }
     if (method === 'POST' && path === '/api/v1/auth/logout') {
-      sessions.delete(hash(token(req))); res.setHeader('Set-Cookie', cookie('', 0)); json(res, 200, { status: 'ok' }); return
+      const digest = hash(token(req))
+      sessions.delete(digest); sessionIdentities.delete(digest)
+      res.setHeader('Set-Cookie', cookie('', 0)); json(res, 200, { status: 'ok' }); return
     }
     if (method === 'GET' && path === '/api/v1/account/devices') {
       accountAuth(req); json(res, 200, { items: store.list().map(descriptor), serverUrl: url.origin, transport: 'webrtc' }); return

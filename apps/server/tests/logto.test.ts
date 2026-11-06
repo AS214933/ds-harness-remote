@@ -9,7 +9,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LogtoAuthProvider } from '../src/auth/logto.js'
-import type { LogtoConfig } from '../src/auth/logto.js'
+import type { AuthProvider, LogtoConfig } from '../src/auth/logto.js'
 
 const config: LogtoConfig = {
   endpoint: 'https://logto.test',
@@ -209,5 +209,142 @@ describe('LogtoAuthProvider construction', () => {
     const partial = { ...config, clientSecret: '' }
     expect(() => new LogtoAuthProvider(partial)).toThrow(/LOGTO_M2M_CLIENT_SECRET/)
     expect(() => new LogtoAuthProvider({ ...config, endpoint: '' })).toThrow(/LOGTO_ENDPOINT/)
+  })
+})
+
+describe('login route with a provider', () => {
+  /**
+   * The route has to keep the shipped clients' contract byte-identical while
+   * letting the provider own the decision. These tests drive createRemoteServer
+   * with a stub provider so no Logto is needed.
+   */
+  async function startServer(outcome: Awaited<ReturnType<AuthProvider['authenticate']>>) {
+    const { createRemoteServer } = await import('../src/server.js')
+    const { mkdtempSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { once } = await import('node:events')
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-login-'))
+    const calls: { email: string; password: string }[] = []
+    const provider: AuthProvider = {
+      authenticate: async (email, password) => {
+        calls.push({ email, password })
+        return outcome
+      },
+    }
+    const app = createRemoteServer({
+      account: 'owner@example.com',
+      password: 'local-test-password',
+      dataFile: join(dir, 'state.json'),
+      publicUrl: 'http://localhost:8080',
+      auth: provider,
+    })
+    app.server.listen(0, '127.0.0.1')
+    await once(app.server, 'listening')
+    const base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`
+    const login = async (body: unknown) => {
+      const response = await fetch(`${base}/api/v1/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      return { status: response.status, data: await response.json(), headers: response.headers }
+    }
+    return { app, login, calls, base }
+  }
+
+  it('returns exactly the fields the shipped clients parse', async () => {
+    const { app, login } = await startServer({ ok: true, externalId: 'u1', email: 'alice@example.com', isAdmin: false })
+    try {
+      const result = await login({ email: 'alice@example.com', password: 'pw' })
+      expect(result.status).toBe(200)
+      // No extra keys: a new field would be invisible to old clients but could be
+      // misread by strict ones, so the shape stays identical to single-account.
+      expect(Object.keys(result.data).sort()).toEqual(['account', 'expiresAt', 'isAdmin', 'profile', 'token'])
+      expect(result.data.account).toBe('alice@example.com')
+      expect(result.data.isAdmin).toBe(false)
+      expect(result.headers.get('set-cookie')).toContain('HttpOnly')
+    } finally { await app.close() }
+  })
+
+  it('forwards the credentials to the provider', async () => {
+    const { app, login, calls } = await startServer({ ok: true, externalId: 'u1', email: 'a@b.com', isAdmin: false })
+    try {
+      await login({ email: 'a@b.com', password: 'secret' })
+      expect(calls).toEqual([{ email: 'a@b.com', password: 'secret' }])
+    } finally { await app.close() }
+  })
+
+  it('maps invalid to 401 and ambiguous to the same 401', async () => {
+    for (const reason of ['invalid', 'ambiguous'] as const) {
+      const { app, login } = await startServer({ ok: false, reason })
+      try {
+        const result = await login({ email: 'a@b.com', password: 'pw' })
+        expect(result.status).toBe(401)
+        expect(result.data.error.code).toBe('AUTH_INVALID')
+      } finally { await app.close() }
+    }
+  })
+
+  it('maps suspended to 403 ACCOUNT_SUSPENDED', async () => {
+    const { app, login } = await startServer({ ok: false, reason: 'suspended' })
+    try {
+      const result = await login({ email: 'a@b.com', password: 'pw' })
+      expect(result.status).toBe(403)
+      expect(result.data.error.code).toBe('ACCOUNT_SUSPENDED')
+    } finally { await app.close() }
+  })
+
+  it('maps an unavailable provider to 503, not 401', async () => {
+    // A Logto outage must not look like a wrong password: clients would prompt
+    // the user to re-enter credentials for an infrastructure failure.
+    const { app, login } = await startServer({ ok: false, reason: 'unavailable' })
+    try {
+      const result = await login({ email: 'a@b.com', password: 'pw' })
+      expect(result.status).toBe(503)
+      expect(result.data.error.code).toBe('AUTH_SERVICE_UNAVAILABLE')
+    } finally { await app.close() }
+  })
+
+  it('reports the signed-in identity from /auth/me, not the env account', async () => {
+    const { app, login, base } = await startServer({ ok: true, externalId: 'u1', email: 'alice@example.com', isAdmin: true })
+    try {
+      const { data } = await login({ email: 'alice@example.com', password: 'pw' })
+      const me = await fetch(`${base}/api/v1/auth/me`, {
+        headers: { Authorization: `Bearer ${data.token}` },
+      })
+      const body = await me.json()
+      expect(body.account).toBe('alice@example.com')
+      expect(body.isAdmin).toBe(true)
+    } finally { await app.close() }
+  })
+
+  it('still honours the environment single account when no provider is set', async () => {
+    const { createRemoteServer } = await import('../src/server.js')
+    const { mkdtempSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { once } = await import('node:events')
+    const app = createRemoteServer({
+      account: 'owner@example.com',
+      password: 'local-test-password',
+      dataFile: join(mkdtempSync(join(tmpdir(), 'dsh-login-')), 'state.json'),
+      publicUrl: 'http://localhost:8080',
+    })
+    app.server.listen(0, '127.0.0.1')
+    await once(app.server, 'listening')
+    const base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`
+    try {
+      const good = await fetch(`${base}/api/v1/auth/login`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'owner@example.com', password: 'local-test-password' }),
+      })
+      expect(good.status).toBe(200)
+      const bad = await fetch(`${base}/api/v1/auth/login`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'owner@example.com', password: 'wrong-password-xx' }),
+      })
+      expect(bad.status).toBe(401)
+    } finally { await app.close() }
   })
 })

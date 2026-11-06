@@ -24,6 +24,14 @@ export type AuthOutcome =
   | { ok: true; externalId: string; email: string; isAdmin: boolean }
   | { ok: false; reason: 'invalid' | 'suspended' | 'ambiguous' | 'unavailable' }
 
+/**
+ * What the Server needs from an identity provider. Keeping this free of Logto
+ * types means the login route never learns which provider is behind it.
+ */
+export interface AuthProvider {
+  authenticate(email: string, password: string): Promise<AuthOutcome>
+}
+
 export interface LogtoConfig {
   /** Base URL of the tenant that owns your users, e.g. https://logto.example.com */
   endpoint: string
@@ -60,7 +68,7 @@ function safeEqual(left: string, right: string): boolean {
   return timingSafeEqual(a, b)
 }
 
-export class LogtoAuthProvider {
+export class LogtoAuthProvider implements AuthProvider {
   private cached: { token: string; expiresAt: number } | null = null
   private inflight: Promise<string> | null = null
 
