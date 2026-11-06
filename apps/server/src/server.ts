@@ -205,10 +205,16 @@ export function createRemoteServer(config: Config) {
   const assets = readAssets()
   const sessions = new Map<string, number>()
   const limits = new Map<string, { count: number; until: number }>()
+  /**
+   * Fixed-window counter. Evicting expired buckets on every call keeps the map
+   * bounded, and the ceiling is a safety net for a flood of distinct keys rather
+   * than a fairness mechanism — fairness comes from keying per client and per
+   * account rather than from the number of buckets.
+   */
   function rate(key: string, max: number) {
     for (const [k, v] of limits) if (v.until < Date.now()) limits.delete(k)
     let entry = limits.get(key)
-    if (!entry) { if (limits.size >= 4096) throw new ApiError('RATE_LIMITED', 429); entry = { count: 0, until: Date.now() + 60_000 }; limits.set(key, entry) }
+    if (!entry) { if (limits.size >= 16384) throw new ApiError('RATE_LIMITED', 429); entry = { count: 0, until: Date.now() + 60_000 }; limits.set(key, entry) }
     if (++entry.count > max) throw new ApiError('RATE_LIMITED', 429)
   }
   function token(req: IncomingMessage): string {
@@ -288,6 +294,17 @@ export function createRemoteServer(config: Config) {
     if (method === 'POST' && path === '/api/v1/auth/login') {
       rate(`login:${client}`, 20)
       const credentials = loginSchema.parse(await body(req))
+      // A per-account login budget on top of the per-address one. Without it an
+      // attacker with many addresses gets 20 attempts per address against one
+      // account; with it, the account itself is also capped. The key is derived
+      // from the submitted address rather than read from storage, so a rejected
+      // attempt does not reveal whether the account exists.
+      //
+      // Deliberately looser than the per-address budget (20/min): the address
+      // limit is what stops a single source, and this one only has to stop a
+      // source rotating addresses. Setting it lower would make the address limit
+      // unreachable and change the documented behaviour.
+      rate(`login-account:${hash(credentials.email.trim().toLowerCase())}`, 60)
       // With a provider configured, Logto decides whether the credentials are
       // good and whether the account may sign in. Without one, fall back to the
       // environment-variable single account so existing deployments are unchanged.

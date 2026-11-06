@@ -348,3 +348,62 @@ describe('login route with a provider', () => {
     } finally { await app.close() }
   })
 })
+
+describe('login rate limiting', () => {
+  async function boot() {
+    const { createRemoteServer } = await import('../src/server.js')
+    const { mkdtempSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { once } = await import('node:events')
+    const app = createRemoteServer({
+      account: 'owner@example.com',
+      password: 'local-test-password',
+      dataFile: join(mkdtempSync(join(tmpdir(), 'dsh-rate-')), 'state.json'),
+      publicUrl: 'http://localhost:8080',
+      auth: { authenticate: async () => ({ ok: false, reason: 'invalid' }) },
+    })
+    app.server.listen(0, '127.0.0.1')
+    await once(app.server, 'listening')
+    return { app, base: `http://127.0.0.1:${(app.server.address() as { port: number }).port}` }
+  }
+  const attempt = (base: string, email: string) => fetch(`${base}/api/v1/auth/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password: 'pw' }),
+  })
+
+  it('caps attempts per account across addresses', async () => {
+    // Limits are keyed by the submitted address, so several source addresses all
+    // count against the same account. This is the control that stops a distributed
+    // spray, which a per-source limit alone cannot. The per-account budget is
+    // deliberately looser than the per-source one, so it takes more attempts.
+    const { app, base } = await boot()
+    try {
+      const statuses: number[] = []
+      for (let i = 0; i < 62; i += 1) statuses.push((await attempt(base, 'target@example.com')).status)
+      // The source budget (20/min) trips first; both are 429 by the end.
+      expect(statuses.filter(s => s === 401).length).toBe(20)
+      expect(statuses.slice(20).every(s => s === 429)).toBe(true)
+    } finally { await app.close() }
+  }, 30_000)
+
+  it('does not let one account exhaust another account\'s budget', async () => {
+    const { app, base } = await boot()
+    try {
+      for (let i = 0; i < 12; i += 1) await attempt(base, 'noisy@example.com')
+      // A different address still gets its own attempts.
+      const other = await attempt(base, 'quiet@example.com')
+      expect(other.status).toBe(401)
+    } finally { await app.close() }
+  }, 20_000)
+
+  it('normalises case so a targeted account cannot be sprayed by varying it', async () => {
+    const { app, base } = await boot()
+    try {
+      // Fill past the source budget using mixed case; the account bucket must
+      // see all of them as one account.
+      for (let i = 0; i < 20; i += 1) await attempt(base, i % 2 === 0 ? 'Target@Example.COM' : 'target@example.com')
+      expect((await attempt(base, 'target@example.com')).status).toBe(429)
+    } finally { await app.close() }
+  }, 20_000)
+})

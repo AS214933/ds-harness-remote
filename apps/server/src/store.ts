@@ -11,7 +11,16 @@ export const hash = (value: string): string => createHash('sha256').update(value
 export const secret = (): string => randomBytes(32).toString('base64url')
 export const equal = (left: string, right: string): boolean => timingSafeEqual(Buffer.from(hash(left)), Buffer.from(hash(right)))
 const tokenSchema = z.object({ kind: z.enum(['access', 'refresh']), deviceId: z.string(), expires: z.number(), used: z.boolean() })
-const savedDeviceSchema = z.object({ descriptor: accountDeviceDescriptorSchema, revoked: z.boolean(), lastSeenAt: z.number() })
+const savedDeviceSchema = z.object({
+  descriptor: accountDeviceDescriptorSchema,
+  revoked: z.boolean(),
+  lastSeenAt: z.number(),
+  /**
+   * Owning account id. Absent on records written before version 3, which is why
+   * `ownerOf` falls back to the environment account for those.
+   */
+  accountId: z.string().optional(),
+})
 /**
  * One account. `id` is the stable key every device hangs off; `externalId` is the
  * identity-provider subject (Logto `user.id`) when one is configured, and absent
@@ -28,6 +37,16 @@ const accountSchema = z.object({
 })
 type Account = z.infer<typeof accountSchema>
 export type { Account }
+
+/**
+ * Quotas. Sized so one account cannot starve the others: the per-account number
+ * is what a normal operator needs, and the total is a process safety net rather
+ * than a fairness mechanism.
+ */
+export const MAX_DEVICES_PER_ACCOUNT = 64
+export const MAX_DEVICES_TOTAL = 4096
+export const MAX_TOKENS_PER_ACCOUNT = 1024
+export const MAX_TOKENS_TOTAL = 65536
 /**
  * version 2 introduced `accounts` and moved device indices under it. version 1
  * (a single `account` string plus a password verifier) still parses so an
@@ -165,7 +184,9 @@ export class Store {
    * id sees none; reading through here keeps every call site already
    * account-scoped for the day a second account exists.
    */
-  listFor(accountId: string): SavedDevice[] { return accountId === this.accountId ? this.list() : [] }
+  listFor(accountId: string): SavedDevice[] {
+    return this.list().filter(d => this.accountIdOfDevice(d.descriptor.deviceId) === accountId)
+  }
   /**
    * Read a device the given account is allowed to see. A device owned by another
    * account must look exactly like a missing one: reporting 403 instead would
@@ -173,21 +194,37 @@ export class Store {
    */
   getOwned(id: string, accountId: string): SavedDevice {
     const d = this.get(id)
-    if (accountId !== this.accountId) throw new ApiError('DEVICE_NOT_FOUND', 404)
+    if (this.accountIdOfDevice(id) !== accountId) throw new ApiError('DEVICE_NOT_FOUND', 404)
     return d
   }
   register(descriptor: AccountDeviceDescriptor): ReturnType<Store['issue']> {
     const old = this.state.devices[descriptor.deviceId]
     if (old?.revoked) throw new ApiError('DEVICE_REVOKED', 403)
     if (old && (old.descriptor.identityKey !== descriptor.identityKey || old.descriptor.role !== descriptor.role)) throw new ApiError('PEER_IDENTITY_MISMATCH', 409)
-    if (!old && Object.keys(this.state.devices).length >= 256) throw new ApiError('RATE_LIMITED', 429)
-    this.state.devices[descriptor.deviceId] = { descriptor, revoked: false, lastSeenAt: old?.lastSeenAt ?? 0 }
+    if (!old) {
+      // Per-account quota. A global cap would let one account exhaust the room
+      // every other account shares, so the limit follows the owner and a
+      // separate ceiling keeps the process from growing without bound.
+      if (this.ownedCount(this.accountId) >= MAX_DEVICES_PER_ACCOUNT) throw new ApiError('RATE_LIMITED', 429)
+      if (Object.keys(this.state.devices).length >= MAX_DEVICES_TOTAL) throw new ApiError('RATE_LIMITED', 429)
+    }
+    this.state.devices[descriptor.deviceId] = { descriptor, revoked: false, lastSeenAt: old?.lastSeenAt ?? 0, accountId: old?.accountId ?? this.accountId }
     this.invalidate(descriptor.deviceId)
     return this.issue(descriptor.deviceId)
   }
+  /** Devices owned by an account, used for its quota. */
+  private ownedCount(accountId: string): number {
+    return Object.values(this.state.devices).filter(d => (d.accountId ?? this.accountId) === accountId).length
+  }
   private issue(deviceId: string, refreshTokenExpiresAt = Date.now() + 30 * 86400_000) {
     for (const [key, value] of Object.entries(this.state.tokens)) if (value.expires <= Date.now()) delete this.state.tokens[key]
-    if (Object.keys(this.state.tokens).length >= 16384) throw new ApiError('RATE_LIMITED', 429)
+    // Tokens are counted per owning account so a single account churning
+    // credentials cannot lock everyone else out. `accountIdOfDevice` resolves the
+    // owner through the device record, which is where ownership lives.
+    const owner = this.accountIdOfDevice(deviceId)
+    const owned = Object.values(this.state.tokens).filter(t => this.accountIdOfDevice(t.deviceId) === owner).length
+    if (owned >= MAX_TOKENS_PER_ACCOUNT) throw new ApiError('RATE_LIMITED', 429)
+    if (Object.keys(this.state.tokens).length >= MAX_TOKENS_TOTAL) throw new ApiError('RATE_LIMITED', 429)
     const accessToken = secret(), refreshToken = secret()
     const accessTokenExpiresAt = Date.now() + 60 * 60_000
     this.state.tokens[hash(accessToken)] = { kind: 'access', deviceId, expires: accessTokenExpiresAt, used: false }
@@ -195,11 +232,18 @@ export class Store {
     this.save()
     return { accessToken, refreshToken, accessTokenExpiresAt, refreshTokenExpiresAt }
   }
+  /**
+   * Owner of a device. Records written before ownership was stored fall back to
+   * the environment account, which is what they implicitly belonged to.
+   */
+  private accountIdOfDevice(deviceId: string): string {
+    return this.state.devices[deviceId]?.accountId ?? this.accountId
+  }
   authenticate(token: string): AuthenticatedDevice {
     const record = this.state.tokens[hash(token)]
     if (!record || record.kind !== 'access') throw new ApiError('AUTH_INVALID', 401)
     if (record.expires <= Date.now()) throw new ApiError('TOKEN_EXPIRED', 401)
-    return { ...this.get(record.deviceId), accountId: this.accountId }
+    return { ...this.get(record.deviceId), accountId: this.accountIdOfDevice(record.deviceId) }
   }
   refresh(deviceId: string, token: string) {
     this.get(deviceId)

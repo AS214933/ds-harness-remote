@@ -13,7 +13,7 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { createHash } from 'node:crypto'
 import { scryptSync } from 'node:crypto'
-import { Store } from '../src/store.js'
+import { Store, MAX_DEVICES_PER_ACCOUNT } from '../src/store.js'
 import { generateKeyPair } from '../../../packages/crypto/src/index.js'
 
 const ACCOUNT = 'owner@example.com'
@@ -222,5 +222,49 @@ describe('account upsert by identity-provider subject', () => {
     // One account, not two: the first subject adopted the environment account
     // rather than creating a sibling, and the reload did not duplicate it.
     expect(Object.keys(JSON.parse(readFileSync(file, 'utf8')).accounts)).toHaveLength(1)
+  })
+})
+
+describe('per-account quotas', () => {
+  function devices(count: number, accountId?: string) {
+    return Array.from({ length: count }, () => descriptor('host'))
+  }
+
+  it('stops one account at its device quota without affecting the total', () => {
+    const store = new Store(file, ACCOUNT, PASSWORD)
+    // Fill this account to the per-account cap.
+    for (const d of devices(MAX_DEVICES_PER_ACCOUNT)) store.register(d)
+    expect(() => store.register(descriptor('host')))
+      .toThrowError(expect.objectContaining({ code: 'RATE_LIMITED', status: 429 }))
+    // Existing devices remain readable: hitting the cap must not disable them.
+    expect(store.listFor(store.accountId)).toHaveLength(MAX_DEVICES_PER_ACCOUNT)
+  })
+
+  it('re-registering an existing device does not consume quota', () => {
+    const store = new Store(file, ACCOUNT, PASSWORD)
+    const device = descriptor('host')
+    store.register(device)
+    // A device that reconnects with the same identity is an update, not a new
+    // allocation; otherwise a flapping device would exhaust the quota.
+    for (let i = 0; i < MAX_DEVICES_PER_ACCOUNT + 5; i += 1) store.register(device)
+    expect(store.listFor(store.accountId)).toHaveLength(1)
+  })
+
+  it('records the owning account on each device', () => {
+    const store = new Store(file, ACCOUNT, PASSWORD)
+    const device = descriptor('host')
+    store.register(device)
+    const saved = JSON.parse(readFileSync(file, 'utf8'))
+    expect(saved.devices[device.deviceId].accountId).toBe(store.accountId)
+  })
+
+  it('treats a device written before ownership existed as the environment account', () => {
+    // Upgrade path: old records have no accountId and must stay reachable rather
+    // than becoming orphans.
+    const device = descriptor('host')
+    writeV1({ [device.deviceId]: { descriptor: device, revoked: false, lastSeenAt: 5 } })
+    const store = new Store(file, ACCOUNT, PASSWORD)
+    expect(store.listFor(store.accountId)).toHaveLength(1)
+    expect(store.getOwned(device.deviceId, store.accountId).descriptor.deviceId).toBe(device.deviceId)
   })
 })
