@@ -30,6 +30,7 @@ const app = createRemoteServer({
   publicUrl: process.env.DSH_SERVER_PUBLIC_URL ?? `http://localhost:${port}`,
   dataFile: resolve(process.env.DSH_SERVER_DATA_FILE ?? 'data/state.json'),
   trustedProxyIps: (process.env.DSH_SERVER_TRUSTED_PROXY_IPS ?? '').split(',').map(value => value.trim()).filter(Boolean),
+  trustProxyCidr: process.env.DSH_SERVER_TRUST_PROXY_CIDR === '1',
   helloTimeoutMs,
   heartbeatIntervalMs,
   heartbeatDisconnectMs,

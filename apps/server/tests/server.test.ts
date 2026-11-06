@@ -12,6 +12,7 @@ import { NoiseIkSession, createNoisePrologue, generateKeyPair, toBase64Url, from
 import { RelayTransport } from '../../../packages/webrtc/src/index.js'
 import { ClientSecureTransport } from '../../../packages/plugin/src/client-secure-transport.js'
 import {
+  clientAddress,
   createRemoteServer,
   normalizeGatewayOptions,
   normalizeIp,
@@ -1189,5 +1190,50 @@ describe('account scoping', () => {
     } finally {
       Object.defineProperty(store, 'account', { value: original, configurable: true })
     }
+  })
+})
+
+describe('trusted proxy CIDR opt-in', () => {
+  it('rejects CIDR by default and says how to enable it', () => {
+    // Trusting a network is a larger risk than trusting one address, so the
+    // upstream behaviour stays the default and the error explains the opt-in.
+    expect(() => normalizeTrustedProxyIps(['10.0.0.0/8']))
+      .toThrow(/DSH_SERVER_TRUST_PROXY_CIDR=1/)
+  })
+
+  it('accepts CIDR when the opt-in is set, and canonicalises the block', () => {
+    const trusted = normalizeTrustedProxyIps(['10.1.2.3/8'], true)
+    // Stored in network form so the same block written differently collapses.
+    expect([...trusted]).toEqual(['cidr:10.0.0.0/8'])
+    expect([...normalizeTrustedProxyIps(['10.0.0.0/8', '10.1.2.3/8'], true)]).toEqual(['cidr:10.0.0.0/8'])
+  })
+
+  it('rejects malformed CIDR even with the opt-in', () => {
+    for (const invalid of ['10.0.0.0/33', '10.0.0.0/', 'not-an-ip/8', '10.0.0.0/8/8', '::1/128']) {
+      expect(() => normalizeTrustedProxyIps([invalid], true))
+        .toThrow(/DSH_SERVER_TRUSTED_PROXY_IPS/)
+    }
+  })
+
+  it('only trusts X-Forwarded-For from inside the configured block', async () => {
+    // The security property: an address outside the block cannot spoof the
+    // header, so limits stay keyed to the real peer.
+    const trusted = normalizeTrustedProxyIps(['172.16.0.0/12'], true)
+    const inside = { socket: { remoteAddress: '172.16.5.5' }, headers: {}, rawHeaders: ['x-forwarded-for', '203.0.113.9'] } as never
+    expect(clientAddress(inside, trusted)).toBe('203.0.113.9')
+
+    const outside = { socket: { remoteAddress: '198.51.100.7' }, headers: {}, rawHeaders: ['x-forwarded-for', '203.0.113.9'] } as never
+    expect(clientAddress(outside, trusted)).toBe('198.51.100.7')
+  })
+
+  it('covers the whole block, not just its first address', async () => {
+    const trusted = normalizeTrustedProxyIps(['10.0.0.0/8'], true)
+    for (const peer of ['10.0.0.1', '10.128.3.4', '10.255.255.254']) {
+      const request = { socket: { remoteAddress: peer }, headers: {}, rawHeaders: ['x-forwarded-for', '203.0.113.1'] } as never
+      expect(clientAddress(request, trusted)).toBe('203.0.113.1')
+    }
+    // One octet outside the block is not trusted.
+    const outside = { socket: { remoteAddress: '11.0.0.1' }, headers: {}, rawHeaders: ['x-forwarded-for', '203.0.113.1'] } as never
+    expect(clientAddress(outside, trusted)).toBe('11.0.0.1')
   })
 })

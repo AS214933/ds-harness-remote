@@ -31,6 +31,12 @@ export interface Config {
   dataFile: string
   publicUrl: string
   trustedProxyIps?: readonly string[]
+  /**
+   * Allow IPv4 CIDR blocks in `trustedProxyIps`. Off by default because trusting
+   * a whole network lets any host inside it forge `X-Forwarded-For`; needed only
+   * when running behind a CDN whose origin-pull addresses are a range.
+   */
+  trustProxyCidr?: boolean
   helloTimeoutMs?: number
   heartbeatIntervalMs?: number
   heartbeatDisconnectMs?: number
@@ -144,16 +150,98 @@ export function normalizeIp(value: string): string | null {
   const high = Number.parseInt(mapped[1]!, 16), low = Number.parseInt(mapped[2]!, 16)
   return `${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`
 }
-/** Validate and normalize the trusted proxy list at startup. Empty means disabled. */
-export function normalizeTrustedProxyIps(values: readonly string[] = []): ReadonlySet<string> {
+/** Parse one IPv4 literal to a 32-bit number, or null. */
+function ipv4ToInt(value: string): number | null {
+  const parts = value.split('.')
+  if (parts.length !== 4) return null
+  let result = 0
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null
+    const octet = Number(part)
+    if (octet > 255) return null
+    result = result * 256 + octet
+  }
+  return result
+}
+
+/** A CIDR block the proxy list can contain. IPv4 only; IPv6 prefixes are rare for CDNs. */
+interface CidrBlock { base: number; mask: number }
+
+/**
+ * Parse and validate the trusted proxy list at startup. Empty means disabled.
+ *
+ * Entries are bare IPv4/IPv6 literals. **IPv4 CIDR blocks are additionally
+ * accepted only when `allowCidr` is set**, because trusting a whole network is a
+ * strictly larger risk than trusting one address: any host inside the block can
+ * forge `X-Forwarded-For`. Upstream deliberately rejected CIDR for that reason,
+ * so the default keeps that behaviour and a deployment opts in consciously.
+ *
+ * The opt-in exists because a CDN's origin-pull addresses are a range, and
+ * listing them individually is impractical. Without it, putting this Server
+ * behind Cloudflare or EdgeOne would make every request look like it came from
+ * one address, and the per-address rate limits and login lockout would punish
+ * every user at once.
+ *
+ * IPv6 literals are matched exactly (not by prefix): CDN origin addresses in
+ * practice are IPv4, and a wrong prefix match is worse than no match.
+ */
+export function normalizeTrustedProxyIps(values: readonly string[] = [], allowCidr = false): ReadonlySet<string> {
   const result = new Set<string>()
   for (const raw of values) {
     const value = raw.trim()
-    const normalized = value === '' ? null : normalizeIp(value)
-    if (normalized === null) throw new Error(`Invalid DSH_SERVER_TRUSTED_PROXY_IPS entry "${raw}": expected a bare IPv4/IPv6 address (no port, CIDR or hostname).`)
+    if (value === '') {
+      // An empty entry is a configuration mistake, not "no entry": a caller that
+      // meant to disable the list passes an empty array, not [''].
+      throw new Error(`Invalid DSH_SERVER_TRUSTED_PROXY_IPS entry "${raw}": expected a bare IPv4/IPv6 address${allowCidr ? ' or an IPv4 CIDR block' : ''} (no port or hostname).`)
+    }
+    if (value.includes('/')) {
+      if (!allowCidr) {
+        throw new Error(`Invalid DSH_SERVER_TRUSTED_PROXY_IPS entry "${raw}": CIDR blocks require DSH_SERVER_TRUST_PROXY_CIDR=1. Trusting a whole network lets any host in it forge X-Forwarded-For.`)
+      }
+      const [address, prefix, ...rest] = value.split('/')
+      if (rest.length > 0 || address === undefined || prefix === undefined) {
+        throw new Error(`Invalid DSH_SERVER_TRUSTED_PROXY_IPS entry "${raw}": malformed CIDR block.`)
+      }
+      const base = ipv4ToInt(address)
+      if (base === null || !/^\d{1,2}$/.test(prefix) || Number(prefix) > 32) {
+        throw new Error(`Invalid DSH_SERVER_TRUSTED_PROXY_IPS entry "${raw}": expected an IPv4 CIDR block such as 172.16.0.0/12.`)
+      }
+      // Store the canonical network form so the same block written differently
+      // deduplicates, and so the mask is derived once at check time.
+      const bits = Number(prefix)
+      const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
+      const network = (base & mask) >>> 0
+      const dotted = [24, 16, 8, 0].map(shift => (network >>> shift) & 0xff).join('.')
+      result.add(`cidr:${dotted}/${bits}`)
+      continue
+    }
+    const normalized = normalizeIp(value)
+    if (normalized === null) throw new Error(`Invalid DSH_SERVER_TRUSTED_PROXY_IPS entry "${raw}": expected a bare IPv4/IPv6 address${allowCidr ? ' or an IPv4 CIDR block' : ''} (no port or hostname).`)
     result.add(normalized)
   }
   return result
+}
+
+/** Does an address fall inside any configured CIDR block? */
+function matchesCidr(address: string, cidrs: readonly CidrBlock[]): boolean {
+  const value = ipv4ToInt(address)
+  if (value === null) return false
+  return cidrs.some(({ base, mask }) => ((value & mask) >>> 0) === base)
+}
+
+/** Turn the stored set into exact addresses plus parsed CIDR blocks. */
+function splitTrustedProxies(trusted: ReadonlySet<string>): { exact: ReadonlySet<string>; cidrs: CidrBlock[] } {
+  const exact = new Set<string>()
+  const cidrs: CidrBlock[] = []
+  for (const entry of trusted) {
+    if (!entry.startsWith('cidr:')) { exact.add(entry); continue }
+    const [address, bits] = entry.slice(5).split('/')
+    const base = ipv4ToInt(address!)
+    const width = Number(bits)
+    const mask = width === 0 ? 0 : (0xffffffff << (32 - width)) >>> 0
+    cidrs.push({ base: (base! & mask) >>> 0, mask })
+  }
+  return { exact, cidrs }
 }
 function readSingleForwardedFor(req: IncomingMessage): string {
   let value: string | undefined
@@ -169,13 +257,15 @@ function readSingleForwardedFor(req: IncomingMessage): string {
 }
 /**
  * Resolve the address used for rate limiting. X-Forwarded-For is honored only
- * when the socket peer is a configured trusted proxy; that peer must send one
- * header holding exactly one IP literal, otherwise the request is rejected.
+ * when the socket peer is a configured trusted proxy — an exact literal or inside
+ * a configured CIDR block; that peer must send one header holding exactly one IP
+ * literal, otherwise the request is rejected.
  */
 export function clientAddress(req: IncomingMessage, trustedProxyIps: ReadonlySet<string>): string {
   const peer = normalizeIp(req.socket.remoteAddress ?? '')
   if (peer === null) throw new ApiError('INVALID_MESSAGE')
-  if (!trustedProxyIps.has(peer)) return peer
+  const { exact, cidrs } = splitTrustedProxies(trustedProxyIps)
+  if (!exact.has(peer) && !matchesCidr(peer, cidrs)) return peer
   const forwarded = normalizeIp(readSingleForwardedFor(req))
   if (forwarded === null) throw new ApiError('INVALID_MESSAGE')
   return forwarded
@@ -220,7 +310,7 @@ export function createRemoteServer(config: Config) {
   if (!config.account.trim() || config.password.length < 12) throw new Error('DSH_SERVER_ACCOUNT and DSH_SERVER_PASSWORD (at least 12 characters) are required.')
   const url = new URL(config.publicUrl)
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('DSH_SERVER_PUBLIC_URL must be an HTTP(S) origin.')
-  const trustedProxyIps = normalizeTrustedProxyIps(config.trustedProxyIps)
+  const trustedProxyIps = normalizeTrustedProxyIps(config.trustedProxyIps, config.trustProxyCidr === true)
   const ice = config.ice ?? parseIceConfig({})
   const store = new Store(config.dataFile, config.account.trim(), config.password)
   const assets = readAssets()
