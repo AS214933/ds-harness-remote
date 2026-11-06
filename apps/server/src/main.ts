@@ -37,6 +37,7 @@ const app = createRemoteServer({
   logLevel,
   ice: parseIceConfig(process.env),
   ...(auth ? { auth } : {}),
+  ...(process.env.LOGTO_WEBHOOK_SIGNING_KEY ? { webhookSigningKey: process.env.LOGTO_WEBHOOK_SIGNING_KEY } : {}),
 })
 app.server.listen(port, process.env.DSH_SERVER_HOST ?? '127.0.0.1', () => console.info(`Remote Server listening on port ${port}`))
 app.server.on('error', () => { console.error('Remote Server could not listen. Check address and port.'); process.exitCode = 1; app.gateway.close() })

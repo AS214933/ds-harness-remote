@@ -8,6 +8,8 @@ import { z } from 'zod'
 import { deviceRegistrationRequestSchema, deviceRefreshRequestSchema } from '@dsh-remote/protocol'
 import { ApiError, Store, equal, hash, secret } from './store.js'
 import type { AuthOutcome, AuthProvider } from './auth/logto.js'
+import { interpret, verifySignature, type WebhookPayload } from './auth/webhook.js'
+import { LoginLockout } from './auth/lockout.js'
 import { Gateway } from './gateway.js'
 import { buildIceServers, parseIceConfig, type IceConfig } from './ice.js'
 import { Logger, type LogLevel } from './logger.js'
@@ -42,6 +44,18 @@ export interface Config {
    * has not configured Logto keeps working unchanged.
    */
   auth?: AuthProvider
+  /**
+   * Signing key for Logto webhooks. When present, `POST /api/v1/hooks/logto`
+   * accepts user-lifecycle events and revokes sessions for deleted or suspended
+   * accounts immediately instead of waiting for tokens to expire.
+   */
+  webhookSigningKey?: string
+  /**
+   * Tuning for the consecutive-failure login lockout. Exposed mainly so tests can
+   * reach the threshold without making 25 real requests; production uses the
+   * defaults, which sit above the per-address rate limit on purpose.
+   */
+  lockout?: { threshold?: number; lockMs?: number; streakMs?: number }
 }
 
 /**
@@ -94,14 +108,21 @@ function readAssets(): Map<string, Buffer> {
 }
 async function body(req: IncomingMessage): Promise<unknown> {
   if (!req.headers['content-type']?.toLowerCase().startsWith('application/json')) throw new ApiError('INVALID_MESSAGE', 415)
+  return JSON.parse(await rawBody(req).then(buffer => buffer.toString('utf8'))) as unknown
+}
+/**
+ * Read the request body as bytes. Webhook signatures are computed over the raw
+ * bytes, so this must not be replaced with a parsed round-trip.
+ */
+async function rawBody(req: IncomingMessage, limit = 16384): Promise<Buffer> {
   let length = 0
   const chunks: Buffer[] = []
   for await (const chunk of req) {
     length += chunk.length
-    if (length > 16384) throw new ApiError('FRAME_TOO_LARGE', 413)
+    if (length > limit) throw new ApiError('FRAME_TOO_LARGE', 413)
     chunks.push(chunk)
   }
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { throw new ApiError('INVALID_MESSAGE') }
+  return Buffer.concat(chunks)
 }
 /**
  * Normalize one bare IPv4/IPv6 literal to a single canonical form. IPv4-mapped
@@ -205,6 +226,8 @@ export function createRemoteServer(config: Config) {
   const assets = readAssets()
   const sessions = new Map<string, number>()
   const limits = new Map<string, { count: number; until: number }>()
+  /** Consecutive-failure lockout, independent of the fixed-window rate limits. */
+  const lockout = new LoginLockout(config.lockout)
   /**
    * Fixed-window counter. Evicting expired buckets on every call keeps the map
    * bounded, and the ceiling is a safety net for a flood of distinct keys rather
@@ -291,6 +314,35 @@ export function createRemoteServer(config: Config) {
     if (method === 'GET' && (path === '/health' || path === '/healthz' || path === '/ready')) { json(res, 200, { status: 'ok' }); return }
     const client = clientAddress(req, trustedProxyIps)
     rate(`api:${client}`, 240)
+    if (method === 'POST' && path === '/api/v1/hooks/logto') {
+      // Webhooks bypass the account-session and device checks: they authenticate
+      // by signature. They are rate limited like any other request so a flood
+      // cannot hammer the revocation path.
+      const signingKey = config.webhookSigningKey
+      if (!signingKey) throw new ApiError('METHOD_NOT_FOUND', 404)
+      const raw = await rawBody(req)
+      const signature = req.headers['logto-signature-sha-256']
+      if (!verifySignature(signingKey, raw, typeof signature === 'string' ? signature : undefined)) {
+        // 401 without detail: a probing caller learns nothing about the key.
+        throw new ApiError('AUTH_INVALID', 401)
+      }
+      let payload: WebhookPayload
+      try {
+        payload = JSON.parse(raw.toString('utf8')) as WebhookPayload
+      } catch {
+        // The signature already proved this came from Logto, so it is not an
+        // attack; a malformed body is a bug we cannot fix by asking for a retry.
+        // Ack it so Logto does not re-deliver the same broken payload forever.
+        json(res, 200, { status: 'ok', ignored: 'malformed' }); return
+      }
+      const outcome = interpret(payload)
+      if (outcome.handled && outcome.revoke && outcome.userId !== null) {
+        store.revokeAccountSessions(outcome.userId)
+      }
+      // Always 200 once the signature is good: a non-2xx makes Logto retry, and a
+      // malformed-but-authentic event is not something retrying will fix.
+      json(res, 200, { status: 'ok' }); return
+    }
     if (method === 'POST' && path === '/api/v1/auth/login') {
       rate(`login:${client}`, 20)
       const credentials = loginSchema.parse(await body(req))
@@ -305,12 +357,36 @@ export function createRemoteServer(config: Config) {
       // source rotating addresses. Setting it lower would make the address limit
       // unreachable and change the documented behaviour.
       rate(`login-account:${hash(credentials.email.trim().toLowerCase())}`, 60)
+      // Lockout is a separate signal from the fixed-window rate limits: those
+      // forgive a patient attacker every minute, this one accumulates. Keyed by
+      // the submitted address so a lockout never reveals whether it exists.
+      const lockKey = hash(credentials.email.trim().toLowerCase())
+      const locked = lockout.check(lockKey)
+      if (locked.locked) {
+        res.setHeader('Retry-After', String(Math.ceil(locked.retryAfterMs / 1000)))
+        throw new ApiError('ACCOUNT_LOCKED', 429)
+      }
       // With a provider configured, Logto decides whether the credentials are
       // good and whether the account may sign in. Without one, fall back to the
       // environment-variable single account so existing deployments are unchanged.
-      const identity = config.auth
-        ? await verifyWithProvider(config.auth, credentials.email, credentials.password)
-        : verifyWithConfig(config, credentials)
+      let identity: LoginIdentity
+      try {
+        identity = config.auth
+          ? await verifyWithProvider(config.auth, credentials.email, credentials.password)
+          : verifyWithConfig(config, credentials)
+      } catch (error) {
+        // Only a credential rejection counts toward the streak. A 503 from an
+        // unreachable provider must not lock users out of their own accounts.
+        if (error instanceof ApiError && error.status === 401) {
+          const after = lockout.recordFailure(lockKey)
+          if (after.locked) {
+            res.setHeader('Retry-After', String(Math.ceil(after.retryAfterMs / 1000)))
+            throw new ApiError('ACCOUNT_LOCKED', 429)
+          }
+        }
+        throw error
+      }
+      lockout.recordSuccess(lockKey)
       // Anchor the session to a durable account row. With a provider this is the
       // Logto subject; without one it is the environment account. Devices are
       // owned through this id, so the login and the device routes agree on who

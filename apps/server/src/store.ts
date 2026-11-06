@@ -239,6 +239,41 @@ export class Store {
   private accountIdOfDevice(deviceId: string): string {
     return this.state.devices[deviceId]?.accountId ?? this.accountId
   }
+  /**
+   * Revoke every device belonging to the account with this identity-provider
+   * subject. Called from the webhook path when a user is deleted or suspended.
+   *
+   * Revoking (rather than merely disconnecting) is deliberate: a suspended user
+   * who reconnects with a still-valid access token would otherwise walk straight
+   * back in, because `password/verify` cannot see suspension. Marking the devices
+   * revoked makes the token permanently unusable until an operator re-registers.
+   *
+   * Returns the device ids that were revoked, for logging and tests.
+   */
+  revokeAccountSessions(externalId: string): string[] {
+    const account = Object.values(this.state.accounts).find(a => a.externalId === externalId)
+    if (account === undefined) return []
+    const revoked: string[] = []
+    for (const [deviceId, device] of Object.entries(this.state.devices)) {
+      if ((device.accountId ?? this.accountId) !== account.id || device.revoked) continue
+      device.revoked = true
+      revoked.push(deviceId)
+    }
+    // Suspend the account as well: a later login must not silently re-enable it.
+    account.status = 'suspended'
+    if (revoked.length > 0) for (const id of revoked) this.invalidate(id)
+    else this.save()
+    return revoked
+  }
+
+  /** Mark an account active again, e.g. after a reactivation webhook. */
+  activateAccount(externalId: string): boolean {
+    const account = Object.values(this.state.accounts).find(a => a.externalId === externalId)
+    if (account === undefined || account.status === 'active') return false
+    account.status = 'active'
+    this.save()
+    return true
+  }
   authenticate(token: string): AuthenticatedDevice {
     const record = this.state.tokens[hash(token)]
     if (!record || record.kind !== 'access') throw new ApiError('AUTH_INVALID', 401)
