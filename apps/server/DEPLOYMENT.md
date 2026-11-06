@@ -191,6 +191,52 @@ STEP 6 停用用户 + 正确密码  → 204   ← 关键：确认停用不挡
 **若 STEP 1 报 `invalid_client`** → 你建在了 admin 租户，或端点端口用错了。
 **若 STEP 1 返回 400 但另一个端口是 200** → 就是租户/端口错配。
 
+### 2.6 配置 Webhook（可选，但推荐）
+
+不加 webhook 也能用，但**被停用的用户最长要等 8 小时** token 过期才被挡住。
+加了之后是秒级。
+
+**Console → Webhooks → Create webhook：**
+
+| 字段 | 值 |
+| --- | --- |
+| Name | 任意，例如 `dsh-remote-revoke` |
+| **Endpoint URL** | `https://你的域名/api/v1/hooks/logto`（**必须公网 HTTPS**） |
+| **Events** | 只选两个：**`User.Deleted`** 与 **`User.SuspensionStatus.Updated`** |
+
+创建后在 webhook 详情页：
+
+1. 找到 **Signing key**，复制
+2. 填进 Server 的 `LOGTO_WEBHOOK_SIGNING_KEY`
+
+**然后配置 Server 的环境变量：**
+
+```dotenv
+LOGTO_WEBHOOK_SIGNING_KEY=<从 Console 复制的签名密钥>
+```
+
+**验证：** Console 里的 **"Send test payload"** 按钮会发一个测试事件。
+Server 返回 200 即通。
+
+> ⚠️ **Logto 要求 Endpoint URL 是公网可达的 HTTPS。** 本地 `http://127.0.0.1`
+> 或内网 IP 会被拒绝投递（实测：hook 触发但投递失败）。
+> 所以 webhook 这条链路**必须暴露公网**，这和我们把 Logto 放内网的建议（§0.3）
+> 是不同方向的——**Server 要能被 Logto 回调，Logto 不需要被 Server 之外访问**。
+
+**不配 webhook 的替代方案：** 缩短 `expiresAt`。当前 Web 会话 8 小时；
+若可接受更短，改 `server.ts` 里的 `8 * 3600_000`。设备 access token 是 1 小时。
+
+### 2.7 Webhook 的可靠性边界
+
+| 事实 | 影响 |
+| --- | --- |
+| 只对 **≥500** 的响应重试，最多 3 次 | 返回 401/403/404 **不会**重试，那是永久失败 |
+| 重试共享同一个 `deliveryId` | 幂等处理需要时可据此去重 |
+| **不能阻断登录** | 异步投递，所以登录路径仍必须自查 `isSuspended` |
+| 投递失败无人提醒 | 要定期看 Console 的 health status 与 recent requests |
+
+**所以 webhook 只是缩短窗口，不是唯一控制。** 登录时的 `isSuspended` 检查是兜底。
+
 ---
 
 ## 3. Server 配置
@@ -204,6 +250,9 @@ LOGTO_M2M_CLIENT_ID=<app id>
 LOGTO_M2M_CLIENT_SECRET=<app secret>
 LOGTO_API_RESOURCE=https://default.logto.app/api
 LOGTO_ADMIN_ROLE=admin
+
+# --- Webhook（可选；配置后停用/删除用户秒级生效） ---
+LOGTO_WEBHOOK_SIGNING_KEY=<Console → Webhooks → Signing key>
 
 # --- 以下仍然必填，即使已启用 Logto ---
 DSH_SERVER_ACCOUNT=owner@example.com
@@ -321,9 +370,32 @@ Server 用 Logto 的 `password/verify` 校验，该接口是**纯哈希比对**�
 | --- | --- | --- |
 | 密码错 / 邮箱不存在 / 匹配到多个 | 401 | `AUTH_INVALID` |
 | 账号被停用 | 403 | `ACCOUNT_SUSPENDED` |
+| 连续失败超过阈值 | 429 | `ACCOUNT_LOCKED`（带 `Retry-After`） |
+| 限流 | 429 | `RATE_LIMITED` |
 | Logto 不可达 | 503 | `AUTH_SERVICE_UNAVAILABLE` |
 
-**后者的区分很重要**：Logto 故障返回 401 会让客户端提示用户重新输入一个其实正确的密码。
+**503 与 401 的区分很重要**：Logto 故障返回 401 会让客户端提示用户重新输入一个
+其实正确的密码。
+
+**`ACCOUNT_LOCKED` 是新错误码**。老客户端不认识它，会落到通用的「登录失败」分支——
+行为是可接受的（用户确实登不进去），但比不上专门的提示。如果你在意，
+可以改成复用 `RATE_LIMITED`（客户端可能已有针对 429 的重试提示）。当前选择
+`ACCOUNT_LOCKED` 是为了让日志和排错能区分「限流」与「锁定」。
+
+### 5.4 Webhook 触发后发生什么
+
+用户被删除或被停用时：
+
+1. 该账户的**所有设备**标记为 `revoked` —— 注意是**撤销**，不只是断开连接
+2. 该账户的**所有 token** 被删除（设备用旧 token 立即失效）
+3. 账户 `status` 置为 `suspended`
+
+**为什么用撤销而不是断开**：一个被停用的用户如果只是被断开，他带着仍然有效的
+token 重连会**直接走回来**——因为 `password/verify` 看不见停用状态。
+
+**恢复时需要运维手工介入**：把账户 `status` 改回 `active`，
+然后让用户**重新配对设备**。设备不会自动解封，这是刻意的——
+被撤销的设备可能对应一枚已泄露的 token。
 
 ---
 
@@ -335,10 +407,37 @@ Server 用 Logto 的 `password/verify` 校验，该接口是**纯哈希比对**�
 | --- | --- |
 | 用户枚举（错误码） | 密码错与邮箱不存在返回同一个 401 |
 | 用户枚举（时序） | 所有失败路径统一补到 700ms 预算【实测：修复前差 17 倍】 |
-| 暴力破解 | 单地址 20/min + 每账户 60/min |
+| 暴力破解（单来源） | 单地址 20/min |
+| 暴力破解（换地址） | 每账户 60/min |
+| **持续慢速猜测** | **连续失败 25 次 → 锁定 5 分钟** |
 | 跨账户越权 | `connect.request` 校验账户归属，回 `HOST_OFFLINE` 而非新增错误码 |
 | 存在性探测 | 外部设备返回 404，与不存在完全一致 |
 | 密码变更后设备失效 | 环境密码变化时清空 tokens |
+| 停用/删除后立即失效 | 配 Webhook 时秒级；否则等 token 过期 |
+
+#### 关于锁定阈值的层级关系
+
+三层限制的数值是**刻意分层**的，不要随意调低某一层：
+
+```
+单地址   20/min  ← 挡住单一来源
+每账户   60/min  ← 挡住轮换地址
+连击锁   25 次   ← 挡住持续慢速猜测
+```
+
+**每账户必须 > 单地址**：否则单地址 20 次的预算永远用不到，行为被悄悄改掉。
+**锁定阈值必须 > 单地址**：同理，否则它先触发，锁定就变成了"改了限流语义"。
+
+我开发时两次踩到这个坑（先设每账户 10、后设锁定 8），都是既有测试抓出来的。
+如果你要调整，**先跑 §7 的回归**。
+
+#### 锁定不是永久的
+
+锁定 **5 分钟后自动解除**，并且**成功登录会清空连击数**。
+理由：永久锁定会让任何人都能对任意邮箱做拒绝服务。
+
+**副作用**：锁定状态在内存里，**重启会清空**。这是刻意的取舍——窗口很短，
+持久化会让每次失败登录都写一次盘。
 
 ### 6.2 时序对齐是个需要跟着环境走的常数
 
@@ -349,11 +448,13 @@ Server 用 Logto 的 `password/verify` 校验，该接口是**纯哈希比对**�
 
 ### 6.3 没有做的
 
-- **登录失败计数与账号锁定**：只做了限流，没做「连续 N 次失败锁定账号」。
-  需要的话可订阅 Logto 的 `Identifier.Lockout` webhook。
 - **密码过期检查**：本部署未启用该策略，代码里主动跳过（省一次网络调用、少一个失败面）。
-- **Webhook 接收端**：用户被删/停用后，最长要等 token 过期（8 小时）或下次登录才发现。
-  需要实时踢下线就要自己接 `User.Deleted` / `User.SuspensionStatus.Updated`。
+- **Webhook 的去重**：`deliveryId` 收到了但没用来做幂等。吊销是幂等操作
+  （重复吊销同一账户无副作用），所以不值得为此加状态。
+- **账号级「永久封禁」**：只做到「撤销所有设备 + 账号置 suspended」。
+  恢复需要运维手工把 `accounts.status` 改回 `active`，
+  **被撤销的设备不会自动恢复**（这是刻意的，见 §5.4）。
+- **锁定状态的持久化**：见 §6.1 最后一段。
 
 ---
 
@@ -433,6 +534,10 @@ python3 probe_blast_radius.py <client_id> <client_secret>
 | 升级后设备全部离线 | 迁移未生效或账户名变了 | 检查 `state.json` 的 `version` 是否为 2；确认没改 `DSH_SERVER_ACCOUNT` |
 | 登录后看不到设备 | 登录的是第二个账户 | 正常行为（§4.2）；用原账户登录 |
 | `server could not listen` | 端口被占 | 查 `DSH_SERVER_PORT` |
+| 登录返回 429 `ACCOUNT_LOCKED` | 该账户连续失败达阈值 | 等 5 分钟；或重启 Server 清空（状态在内存） |
+| Webhook 在 Console 显示失败 | Endpoint URL 不是公网 HTTPS，或签名密钥不匹配 | 查 §2.6；本地地址会被拒绝投递 |
+| Webhook 一直不触发 | 事件没选对 | 必须选 `User.Deleted` + `User.SuspensionStatus.Updated` |
+| 停用用户仍能连 | 没配 webhook 且 token 未过期 | 等过期，或配 webhook（§2.6） |
 
 ---
 
@@ -459,4 +564,6 @@ python3 probe_blast_radius.py <client_id> <client_secret>
 - [ ] `state.json` 已备份
 - [ ] 迁移后**抽查一台真实设备**仍能连上
 - [ ] 部署文档写明了「2FA 在本服务不生效」
+- [ ] （可选）Webhook 已配置：`/api/v1/hooks/logto` 可从公网访问、签名密钥已填、
+      Console 的 test payload 返回 200
 - [ ] 知道泄露后的应急步骤（§0.4）：轮换 secret + 清查应用与 webhook

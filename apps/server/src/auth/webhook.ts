@@ -24,10 +24,14 @@ const REVOKING_EVENTS = new Set([
 
 export interface WebhookPayload {
   hookId?: string
+  /** Kept across delivery retries; lets a handler deduplicate. */
+  deliveryId?: string
   event?: string
   createdAt?: string
   session?: unknown
   data?: unknown
+  /** Some event shapes carry the user entity at the top level instead of `data`. */
+  user?: unknown
 }
 
 export type WebhookOutcome =
@@ -61,11 +65,11 @@ export function interpret(payload: WebhookPayload): WebhookOutcome {
   if (!REVOKING_EVENTS.has(event)) return { handled: false, reason: 'ignored' }
 
   const data = payload.data
-  const userId = extractUserId(data)
+  const userId = extractUserId(data) ?? extractUserId(payload.user)
   if (event === 'User.Deleted') return { handled: true, event, userId, revoke: true }
 
   // Suspension: revoke only when the account ends up suspended.
-  const suspended = extractSuspended(data)
+  const suspended = extractSuspended(data) ?? extractSuspended(payload.user)
   if (suspended === undefined) {
     // Unknown shape: fail closed. Revoking a reactivated user is a nuisance;
     // leaving a suspended user active is a security failure.
@@ -75,6 +79,17 @@ export function interpret(payload: WebhookPayload): WebhookOutcome {
 }
 
 function extractUserId(data: unknown): string | null {
+  // Where the user entity lives, per Logto's own context manager
+  // (packages/core/src/libraries/hook/context-manager.ts):
+  //
+  //   const { user, ...rest } = context
+  //   push({ event, ...(user ? { data: pick(user, ...) } : {}), ...rest })
+  //
+  // The `user` field is lifted OUT of the context and placed in `data`, so the
+  // id is at `data.id`. (The docs describe `User.Deleted` as `data: null`, which
+  // is stale: the delete route passes `{ user }` explicitly so the payload
+  // carries the deleted entity.) `userId` and a nested `data.user.id` are also
+  // accepted because different event families and older versions differ.
   if (typeof data !== 'object' || data === null) return null
   const record = data as Record<string, unknown>
   for (const key of ['userId', 'id']) {
@@ -87,7 +102,6 @@ function extractUserId(data: unknown): string | null {
   }
   return null
 }
-
 function extractSuspended(data: unknown): boolean | undefined {
   if (typeof data !== 'object' || data === null) return undefined
   const record = data as Record<string, unknown>

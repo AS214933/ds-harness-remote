@@ -214,3 +214,51 @@ describe('revocation on webhook', () => {
       .toThrowError(expect.objectContaining({ code: 'DEVICE_REVOKED' }))
   })
 })
+
+describe('payload shapes as Logto actually sends them', () => {
+  /**
+   * Shapes taken from Logto's context manager
+   * (packages/core/src/libraries/hook/context-manager.ts), which lifts `user`
+   * out of the route context and places it in `data`. The published docs still
+   * describe `User.Deleted` as `data: null`, but the delete route passes
+   * `{ user }` explicitly, so the entity is present.
+   */
+  it('reads the user id from data.id for a deletion', () => {
+    expect(interpret({
+      event: 'User.Deleted',
+      deliveryId: 'd1',
+      data: { id: 'abc123', primaryEmail: 'x@example.com', isSuspended: false },
+    })).toEqual({ handled: true, event: 'User.Deleted', userId: 'abc123', revoke: true })
+  })
+
+  it('reads suspension state from data for a suspension change', () => {
+    expect(interpret({
+      event: 'User.SuspensionStatus.Updated',
+      data: { id: 'abc123', isSuspended: true },
+    })).toMatchObject({ userId: 'abc123', revoke: true })
+    expect(interpret({
+      event: 'User.SuspensionStatus.Updated',
+      data: { id: 'abc123', isSuspended: false },
+    })).toMatchObject({ userId: 'abc123', revoke: false })
+  })
+
+  it('still handles a top-level user entity from an older delivery', () => {
+    expect(interpret({
+      event: 'User.Deleted',
+      user: { id: 'legacy1' },
+    } as never)).toMatchObject({ userId: 'legacy1', revoke: true })
+  })
+
+  it('still handles a nested data.user entity', () => {
+    expect(interpret({
+      event: 'User.Deleted',
+      data: { user: { id: 'nested1' } },
+    })).toMatchObject({ userId: 'nested1', revoke: true })
+  })
+
+  it('does not revoke when the deletion payload yields no id', () => {
+    // Nothing to revoke; the handler must not guess and must not crash.
+    const outcome = interpret({ event: 'User.Deleted', data: null })
+    expect(outcome).toMatchObject({ revoke: true, userId: null })
+  })
+})
