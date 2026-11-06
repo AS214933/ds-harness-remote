@@ -261,7 +261,7 @@ export function createRemoteServer(config: Config) {
     turnEnabled: ice.turnUrls.length > 0,
   })
   function descriptor(d: ReturnType<Store['get']>) {
-    return { ...d.descriptor, membershipId: `account:${hash(store.account).slice(0, 16)}`, online: gateway.peers.has(d.descriptor.deviceId), lastSeenAt: d.lastSeenAt }
+    return { ...d.descriptor, membershipId: store.accountId, online: gateway.peers.has(d.descriptor.deviceId), lastSeenAt: d.lastSeenAt }
   }
   async function route(req: IncomingMessage, res: ServerResponse) {
     const requestUrl = new URL(req.url ?? '/', url)
@@ -369,7 +369,7 @@ export function createRemoteServer(config: Config) {
     if (method === 'POST' && renameMatch) {
       accountAuth(req)
       const { name } = z.object({ name: z.string().trim().min(1).max(80) }).parse(await body(req))
-      store.rename(store.getOwned(renameMatch[1]!, store.account).descriptor.deviceId, name)
+      store.rename(store.getOwned(renameMatch[1]!, store.accountId).descriptor.deviceId, name)
       json(res, 200, descriptor(store.get(renameMatch[1]!))); return
     }
     const match = /^\/api\/v1\/devices\/([^/]+)(\/presence)?$/.exec(path)

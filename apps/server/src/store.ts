@@ -12,30 +12,96 @@ export const secret = (): string => randomBytes(32).toString('base64url')
 export const equal = (left: string, right: string): boolean => timingSafeEqual(Buffer.from(hash(left)), Buffer.from(hash(right)))
 const tokenSchema = z.object({ kind: z.enum(['access', 'refresh']), deviceId: z.string(), expires: z.number(), used: z.boolean() })
 const savedDeviceSchema = z.object({ descriptor: accountDeviceDescriptorSchema, revoked: z.boolean(), lastSeenAt: z.number() })
-const stateSchema = z.object({ version: z.literal(1), account: z.string(), salt: z.string(), verifier: z.string(), devices: z.record(z.string(), savedDeviceSchema), tokens: z.record(z.string(), tokenSchema) })
+/**
+ * One account. `id` is the stable key every device hangs off; `externalId` is the
+ * identity-provider subject (Logto `user.id`) when one is configured, and absent
+ * for the environment-variable single account. Email is stored but never used as
+ * a key: it is mutable, and after a user is deleted it can be re-registered by
+ * someone else, which would silently hand over the previous owner's devices.
+ */
+const accountSchema = z.object({
+  id: z.string(),
+  externalId: z.string().optional(),
+  email: z.string(),
+  isAdmin: z.boolean(),
+  status: z.enum(['active', 'suspended']),
+})
+type Account = z.infer<typeof accountSchema>
+/**
+ * version 2 introduced `accounts` and moved device indices under it. version 1
+ * (a single `account` string plus a password verifier) still parses so an
+ * existing state.json upgrades in place rather than being rejected.
+ */
+const stateSchemaV2 = z.object({
+  version: z.literal(2),
+  accounts: z.record(z.string(), accountSchema),
+  devices: z.record(z.string(), savedDeviceSchema),
+  tokens: z.record(z.string(), tokenSchema),
+  /**
+   * The environment single account, kept for the password comparison and for
+   * choosing which account a new device registers under while the Server runs
+   * without an identity provider. Removed once Logto is the only entry point.
+   */
+  account: z.string(),
+  salt: z.string(),
+  verifier: z.string(),
+})
+const stateSchemaV1 = z.object({ version: z.literal(1), account: z.string(), salt: z.string(), verifier: z.string(), devices: z.record(z.string(), savedDeviceSchema), tokens: z.record(z.string(), tokenSchema) })
+const stateSchema = z.union([stateSchemaV2, stateSchemaV1])
 type SavedDevice = z.infer<typeof savedDeviceSchema>
 /**
- * A stored device plus the account it belongs to. This Server is single-account,
- * so `accountId` is the store's own account; it exists so the Gateway can refuse
- * a cross-account link the moment this Server grows a second account, and so the
- * check is already in place (and already tested) before that change lands.
+ * A stored device plus the account it belongs to. `accountId` is the account's
+ * stable id, not its email, so devices survive a user changing address.
  */
 export type AuthenticatedDevice = SavedDevice & { accountId: string }
 
 /** Single-process store. Only token digests and public identities reach disk. */
 export class Store {
-  private state: z.infer<typeof stateSchema>
+  private state: z.infer<typeof stateSchemaV2>
   onInvalidate: (id: string) => void = () => {}
   constructor(private readonly file: string, readonly account: string, password: string) {
-    const previous = existsSync(file) ? stateSchema.parse(JSON.parse(readFileSync(file, 'utf8'))) : undefined
-    const salt = previous?.salt ?? secret()
+    const parsed = existsSync(file) ? stateSchema.parse(JSON.parse(readFileSync(file, 'utf8'))) : undefined
+    const salt = parsed?.salt ?? secret()
     const verifier = scryptSync(password, salt, 32).toString('hex')
-    this.state = previous ?? { version: 1, account, salt, verifier, devices: {}, tokens: {} }
-    if (this.state.account !== account) this.state.devices = {}
-    if (this.state.account !== account || !equal(this.state.verifier, verifier)) this.state.tokens = {}
+    this.state = parsed === undefined ? this.fresh(account, salt, verifier) : this.upgrade(parsed, account, salt, verifier)
     Object.assign(this.state, { account, verifier })
     this.save()
   }
+  private fresh(account: string, salt: string, verifier: string): z.infer<typeof stateSchemaV2> {
+    return {
+      version: 2,
+      accounts: { [this.accountIdFor(account)]: { id: this.accountIdFor(account), email: account, isAdmin: false, status: 'active' } },
+      devices: {}, tokens: {}, account, salt, verifier,
+    }
+  }
+  /**
+   * Version 1 stored one account by name. Adopt it as-is: keep every device and
+   * token so an operator upgrading does not have to re-pair anything. The only
+   * change is that devices now hang off a stable account id.
+   */
+  private upgrade(parsed: z.infer<typeof stateSchema>, account: string, salt: string, verifier: string): z.infer<typeof stateSchemaV2> {
+    if (parsed.version === 2) {
+      if (parsed.account !== account || !equal(parsed.verifier, verifier)) parsed.tokens = {}
+      if (parsed.account !== account) parsed.devices = {}
+      return parsed
+    }
+    const id = this.accountIdFor(account)
+    return {
+      version: 2,
+      accounts: { [id]: { id, email: account, isAdmin: false, status: 'active' } },
+      devices: parsed.account === account ? parsed.devices : {},
+      tokens: parsed.account === account && equal(parsed.verifier, verifier) ? parsed.tokens : {},
+      account, salt, verifier,
+    }
+  }
+  /**
+   * Stable account key derived from the sign-in name. Hashing keeps the address
+   * out of ids that surface in responses; it is stable across restarts so devices
+   * stay attached.
+   */
+  private accountIdFor(account: string): string { return `account:${hash(account).slice(0, 16)}` }
+  /** The account a request belongs to while the Server is single-account. */
+  get accountId(): string { return this.accountIdFor(this.account) }
   private save(): void {
     mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 })
     const tmp = `${this.file}.tmp`
@@ -50,12 +116,12 @@ export class Store {
   }
   list(): SavedDevice[] { return Object.values(this.state.devices).filter(d => !d.revoked) }
   /**
-   * Devices the given account is allowed to see. This Server is single-account,
-   * so every stored device belongs to `this.account` and any other id sees none.
-   * Reading through here keeps every call site already account-scoped for the
-   * day a second account exists.
+   * Devices the given account is allowed to see. While the Server is
+   * single-account every stored device belongs to `this.accountId` and any other
+   * id sees none; reading through here keeps every call site already
+   * account-scoped for the day a second account exists.
    */
-  listFor(accountId: string): SavedDevice[] { return accountId === this.account ? this.list() : [] }
+  listFor(accountId: string): SavedDevice[] { return accountId === this.accountId ? this.list() : [] }
   /**
    * Read a device the given account is allowed to see. A device owned by another
    * account must look exactly like a missing one: reporting 403 instead would
@@ -63,7 +129,7 @@ export class Store {
    */
   getOwned(id: string, accountId: string): SavedDevice {
     const d = this.get(id)
-    if (accountId !== this.account) throw new ApiError('DEVICE_NOT_FOUND', 404)
+    if (accountId !== this.accountId) throw new ApiError('DEVICE_NOT_FOUND', 404)
     return d
   }
   register(descriptor: AccountDeviceDescriptor): ReturnType<Store['issue']> {
@@ -89,7 +155,7 @@ export class Store {
     const record = this.state.tokens[hash(token)]
     if (!record || record.kind !== 'access') throw new ApiError('AUTH_INVALID', 401)
     if (record.expires <= Date.now()) throw new ApiError('TOKEN_EXPIRED', 401)
-    return { ...this.get(record.deviceId), accountId: this.account }
+    return { ...this.get(record.deviceId), accountId: this.accountId }
   }
   refresh(deviceId: string, token: string) {
     this.get(deviceId)
